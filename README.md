@@ -58,10 +58,7 @@ Claim Your Inner Child (from Merija).md
 1984
 
 ## SHOWS
-The Mandalorian (from Anton).md
-Heavenly delusion
-Heavenly Delusion
-Frieren- beyond journeys end.md
+The Mandalorian (from Anton).md=
 
 ## MOVIES
 Redline (2009).md
