@@ -1755,7 +1755,7 @@ def main():
             if not HAS_REQUESTS:
                 logging.error(
                     "The 'requests' library is required for Wikidata enrichment. "
-                    "Install it with: pip install requests\n"
+                    "Install it with: uv sync (or pip install requests)\n"
                     "Or use --no-enrich to skip enrichment."
                 )
                 sys.exit(1)
