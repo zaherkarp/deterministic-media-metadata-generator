@@ -9,27 +9,29 @@ A deterministic, script-driven tool for building an Obsidian media library from 
 ## Requirements
 
 - Python 3.10+
-- `requests` library (`pip install requests`)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended) or pip
 - macOS, Linux, or Windows (cross-platform filenames)
 - An internet connection (for Wikidata enrichment; not needed with `--no-enrich`)
 
 ## Setup
 
 ```bash
-# 1. Clone the repository
+# 1. Install uv (if you don't have it)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Clone the repository
 git clone <repo-url>
 cd deterministic-media-metadata-generator
 
-# 2. (Recommended) Create a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate   # macOS/Linux
-# .venv\Scripts\activate    # Windows
-
-# 3. Install the single dependency
-pip install requests
+# 3. Install dependencies (uv creates the venv automatically)
+uv sync
 ```
 
+That's it. `uv sync` reads `pyproject.toml`, creates a `.venv`, and installs `requests` into it.
+
 ## Running the Script
+
+All commands use `uv run` — this ensures the correct Python and dependencies are used automatically. No need to manually activate a venv.
 
 ### Step-by-step: First run
 
@@ -38,13 +40,13 @@ pip install requests
 #    The file must have ## section headers for each media type.
 
 # 2. Always start with a dry run to preview what will be created:
-python3 enrich_media.py --input my_media.md --vault ~/my-vault --dry-run
+uv run python enrich_media.py --input my_media.md --vault ~/my-vault --dry-run
 
 #    This prints what notes WOULD be written without touching the filesystem.
 #    Review the output in your terminal. Check for title normalization issues.
 
 # 3. Run for real, one type at a time (recommended):
-python3 enrich_media.py \
+uv run python enrich_media.py \
   --input my_media.md \
   --vault ~/my-vault \
   --only movies \
@@ -55,34 +57,34 @@ python3 enrich_media.py \
 
 # 4. Open your vault in Obsidian and review the generated notes.
 #    Then repeat for other types:
-python3 enrich_media.py -i my_media.md -v ~/my-vault --only shows --out-items media/items
-python3 enrich_media.py -i my_media.md -v ~/my-vault --only books --out-items media/items
-python3 enrich_media.py -i my_media.md -v ~/my-vault --only games --out-items media/items
+uv run python enrich_media.py -i my_media.md -v ~/my-vault --only shows --out-items media/items
+uv run python enrich_media.py -i my_media.md -v ~/my-vault --only books --out-items media/items
+uv run python enrich_media.py -i my_media.md -v ~/my-vault --only games --out-items media/items
 ```
 
 ### Common run patterns
 
 ```bash
 # Process all types at once (notes go to a timestamped folder):
-python3 enrich_media.py --input my_media.md --vault ~/my-vault
+uv run python enrich_media.py --input my_media.md --vault ~/my-vault
 
 # Process all types into a specific folder:
-python3 enrich_media.py --input my_media.md --vault ~/my-vault --out-items media/items
+uv run python enrich_media.py --input my_media.md --vault ~/my-vault --out-items media/items
 
 # Skip Wikidata enrichment (just normalize + generate stub notes):
-python3 enrich_media.py --input my_media.md --vault ~/my-vault --no-enrich
+uv run python enrich_media.py --input my_media.md --vault ~/my-vault --no-enrich
 
 # Package output as a zip instead of writing directly to vault:
-python3 enrich_media.py --input my_media.md --vault ~/my-vault --zip
+uv run python enrich_media.py --input my_media.md --vault ~/my-vault --zip
 
 # Overwrite existing notes (by default, existing notes are skipped):
-python3 enrich_media.py --input my_media.md --vault ~/my-vault --overwrite
+uv run python enrich_media.py --input my_media.md --vault ~/my-vault --overwrite
 
 # Verbose logging (shows SPARQL queries, confidence scores, etc.):
-python3 enrich_media.py --input my_media.md --vault ~/my-vault --verbose
+uv run python enrich_media.py --input my_media.md --vault ~/my-vault --verbose
 
 # Slow down Wikidata requests if you're getting rate-limited:
-python3 enrich_media.py --input my_media.md --vault ~/my-vault --sleep 1.0
+uv run python enrich_media.py --input my_media.md --vault ~/my-vault --sleep 1.0
 ```
 
 ### Where output goes
@@ -94,6 +96,15 @@ python3 enrich_media.py --input my_media.md --vault ~/my-vault --sleep 1.0
 | Zip (if `--zip`) | `./media_enriched_<YYYYMMDD_HHMMSS>.zip` | — |
 
 Paths for `--out-items` and `--out-covers` are **relative to the vault root**, not absolute.
+
+**Important:** If your vault path contains spaces (common with iCloud-synced vaults), wrap it in quotes:
+
+```bash
+uv run python enrich_media.py \
+  --input media_list.md \
+  --vault "/Users/you/Library/Mobile Documents/iCloud~md~obsidian/Documents/MyVault" \
+  --out-items media/items
+```
 
 ## CLI Reference
 
@@ -252,21 +263,21 @@ Process one type at a time for easier review:
 
 ```bash
 # Step 1: Dry run to check normalization
-python3 enrich_media.py -i media.md -v ~/vault --dry-run
+uv run python enrich_media.py -i media.md -v ~/vault --dry-run
 
 # Step 2: Movies first
-python3 enrich_media.py -i media.md -v ~/vault --only movies --out-items media/items
+uv run python enrich_media.py -i media.md -v ~/vault --only movies --out-items media/items
 
 # Step 3: Review the movie notes in Obsidian, fix any issues
 
 # Step 4: Shows
-python3 enrich_media.py -i media.md -v ~/vault --only shows --out-items media/items
+uv run python enrich_media.py -i media.md -v ~/vault --only shows --out-items media/items
 
 # Step 5: Books
-python3 enrich_media.py -i media.md -v ~/vault --only books --out-items media/items
+uv run python enrich_media.py -i media.md -v ~/vault --only books --out-items media/items
 
 # Step 6: Games
-python3 enrich_media.py -i media.md -v ~/vault --only games --out-items media/items
+uv run python enrich_media.py -i media.md -v ~/vault --only games --out-items media/items
 ```
 
 Note: When using a fixed `--out-items` path across runs, existing notes are **skipped** (not overwritten) unless `--overwrite` is passed.
@@ -288,7 +299,7 @@ Note: When using a fixed `--out-items` path across runs, existing notes are **sk
 
 **"No candidates" for most items** — Check that section headers match expected formats (`## MOVIES`, not `### Movies List`).
 
-**"requests not found"** — Run `pip install requests` (or `pip3 install requests`).
+**"requests not found"** — Run `uv sync` from the project directory. This installs all dependencies into the managed venv.
 
 **Covers not rendering in Obsidian** — Ensure the cover path in YAML matches the actual file location relative to vault root. The wikilink format `"[[media/covers/file.jpg]]"` should work in most Obsidian setups.
 

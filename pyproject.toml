@@ -1,0 +1,11 @@
+[project]
+name = "deterministic-media-metadata-generator"
+version = "1.0.0"
+description = "Deterministic media library generator + Wikidata metadata enricher for Obsidian"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28",
+]
+
+[project.scripts]
+enrich-media = "enrich_media:main"
