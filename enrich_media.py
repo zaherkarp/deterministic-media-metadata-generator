@@ -684,7 +684,7 @@ def build_sparql_query(title: str, media_type: str) -> str:
     # and that are instances of the correct media type. We fetch additional
     # properties for scoring.
     query = f"""
-    SELECT DISTINCT ?item ?itemLabel ?date ?image ?genreLabel WHERE {{
+    SELECT DISTINCT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article WHERE {{
       # --- Find items whose label matches our search title ---
       # We use case-insensitive matching via FILTER + LCASE
       ?item rdfs:label ?label .
@@ -704,6 +704,14 @@ def build_sparql_query(title: str, media_type: str) -> str:
       OPTIONAL {{ ?item wdt:P136 ?genre .
                  ?genre rdfs:label ?genreLabel .
                  FILTER(LANG(?genreLabel) = "en") }}
+
+      # --- Optional: description (schema:description) ---
+      OPTIONAL {{ ?item schema:description ?description .
+                 FILTER(LANG(?description) = "en") }}
+
+      # --- Optional: English Wikipedia article link ---
+      OPTIONAL {{ ?article schema:about ?item ;
+                          schema:isPartOf <https://en.wikipedia.org/> . }}
 
       # --- Get English labels ---
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,mul". }}
@@ -732,7 +740,7 @@ def build_sparql_query_fuzzy(title: str, media_type: str) -> str:
     escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
 
     query = f"""
-    SELECT DISTINCT ?item ?itemLabel ?date ?image ?genreLabel WHERE {{
+    SELECT DISTINCT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article WHERE {{
       ?item rdfs:label ?label .
       FILTER(LANG(?label) = "en")
       FILTER(CONTAINS(LCASE(?label), LCASE("{escaped_title}")))
@@ -747,6 +755,14 @@ def build_sparql_query_fuzzy(title: str, media_type: str) -> str:
         ?genre rdfs:label ?genreLabel .
         FILTER(LANG(?genreLabel) = "en")
       }}
+
+      # --- Optional: description ---
+      OPTIONAL {{ ?item schema:description ?description .
+                 FILTER(LANG(?description) = "en") }}
+
+      # --- Optional: English Wikipedia article link ---
+      OPTIONAL {{ ?article schema:about ?item ;
+                          schema:isPartOf <https://en.wikipedia.org/> . }}
 
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,mul". }}
     }}
@@ -850,6 +866,8 @@ def score_candidate(
         "year": None,
         "image_filename": None,
         "genres": [],
+        "description": None,
+        "source_url": None,
         "score": 0,
         "score_breakdown": {},
     }
@@ -905,6 +923,16 @@ def score_candidate(
     if genre_label and genre_label not in result["genres"]:
         result["genres"].append(genre_label)
 
+    # --- Extract: description (1-2 sentence Wikidata description) ---
+    desc_val = candidate.get("description", {}).get("value", "")
+    if desc_val:
+        result["description"] = desc_val
+
+    # --- Extract: source URL (English Wikipedia article) ---
+    article_val = candidate.get("article", {}).get("value", "")
+    if article_val:
+        result["source_url"] = article_val
+
     # --- Fuzzy query penalty ---
     if is_fuzzy:
         result["score"] += CONFIDENCE["AMBIGUITY_PENALTY"]
@@ -957,11 +985,15 @@ def merge_candidates(raw_bindings: list[dict], title: str, year_hint: Optional[i
             if scored["score"] > existing["score"]:
                 existing["score"] = scored["score"]
                 existing["score_breakdown"] = scored["score_breakdown"]
-            # Take year/image if not yet present
+            # Take year/image/description/source_url if not yet present
             if not existing["year"] and scored["year"]:
                 existing["year"] = scored["year"]
             if not existing["image_filename"] and scored["image_filename"]:
                 existing["image_filename"] = scored["image_filename"]
+            if not existing["description"] and scored["description"]:
+                existing["description"] = scored["description"]
+            if not existing["source_url"] and scored["source_url"]:
+                existing["source_url"] = scored["source_url"]
 
     candidates = list(by_qid.values())
     candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -1069,21 +1101,30 @@ def download_cover(
             logging.warning(f"  Cover download returned non-image content-type: {content_type}")
             return None
 
-        # Write the image to disk
+        # Write to a temp file first, then rename on success.
+        # This prevents partial/corrupt files from blocking future retries.
         covers_dir.mkdir(parents=True, exist_ok=True)
-        with open(local_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
+        tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+        try:
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
 
-        file_size = local_path.stat().st_size
-        if file_size < 1000:
-            # Suspiciously small — probably an error page
-            logging.warning(f"  Cover file suspiciously small ({file_size} bytes): {local_filename}")
-            local_path.unlink()
+            file_size = tmp_path.stat().st_size
+            if file_size < 1000:
+                # Suspiciously small — probably an error page
+                logging.warning(f"  Cover file suspiciously small ({file_size} bytes): {local_filename}")
+                tmp_path.unlink(missing_ok=True)
+                return None
+
+            # Atomic-ish rename from temp to final path
+            tmp_path.rename(local_path)
+            logging.info(f"  Downloaded cover: {local_filename} ({file_size:,} bytes)")
+            return local_filename
+        except OSError as e:
+            logging.warning(f"  Cover file write failed for '{local_filename}': {e}")
+            tmp_path.unlink(missing_ok=True)
             return None
-
-        logging.info(f"  Downloaded cover: {local_filename} ({file_size:,} bytes)")
-        return local_filename
 
     except requests.exceptions.RequestException as e:
         logging.warning(f"  Cover download failed for '{image_filename}': {e}")
@@ -1136,6 +1177,8 @@ def enrich_entry(
         "cover_source": None,
         "cover_confidence": None,
         "enriched_genres": [],
+        "description": None,
+        "source_url": None,
         "skip_reason": None,
     })
 
@@ -1214,6 +1257,14 @@ def enrich_entry(
     ]
     entry["enriched_genres"] = filtered_genres[:2]  # max 2 genres
 
+    # Description: short Wikidata description (if available)
+    if winner.get("description"):
+        entry["description"] = winner["description"]
+
+    # Source URL: English Wikipedia link (if available)
+    if winner.get("source_url"):
+        entry["source_url"] = winner["source_url"]
+
     logging.info(
         f"  ENRICHED: '{title}' → QID={winner['qid']}, "
         f"year={entry['enriched_year']}, cover={'yes' if entry['cover_filename'] else 'no'}, "
@@ -1244,6 +1295,9 @@ def generate_note_content(entry: dict, covers_rel_path: str) -> str:
         cover: "[[media/covers/redline-2009.jpg]]"
         cover_source: wikidata
         cover_confidence: high
+        description: "2009 Japanese animated science fiction film"
+        source_url: https://en.wikipedia.org/wiki/Redline_(2009_film)
+        wikidata: Q1234567
         ---
         # Redline
 
@@ -1299,6 +1353,22 @@ def generate_note_content(entry: dict, covers_rel_path: str) -> str:
     # Cover confidence
     if entry.get("cover_confidence"):
         lines.append(f"cover_confidence: {entry['cover_confidence']}")
+
+    # Description: short Wikidata description
+    if entry.get("description"):
+        # Sanitize: strip newlines/carriage returns, escape for YAML
+        desc = entry["description"].replace("\r", "").replace("\n", " ").strip()
+        # Always quote descriptions — they often contain colons, commas, etc.
+        # Escape internal double quotes per YAML spec
+        desc = desc.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'description: "{desc}"')
+
+    # Source URL: link to English Wikipedia article (or Wikidata fallback)
+    # Always quoted — URLs can contain # which YAML treats as comment
+    if entry.get("source_url"):
+        lines.append(f'source_url: "{entry["source_url"]}"')
+    elif entry.get("wikidata_qid"):
+        lines.append(f'source_url: "https://www.wikidata.org/wiki/{entry["wikidata_qid"]}"')
 
     # Wikidata QID: useful for manual verification
     if entry.get("wikidata_qid"):
@@ -1374,9 +1444,13 @@ def write_note(
 
     content = generate_note_content(entry, covers_rel_path)
 
-    items_dir.mkdir(parents=True, exist_ok=True)
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
+    try:
+        items_dir.mkdir(parents=True, exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+    except OSError as e:
+        logging.warning(f"  Failed to write note '{filepath}': {e}")
+        return False
 
     logging.info(f"  Wrote: {filepath}")
     return True
@@ -1635,107 +1709,140 @@ def main():
     raw_entries = parse_input_file(str(input_path), only_type=only_type)
     if not raw_entries:
         logging.warning("No entries found in input file. Check section headers.")
+        if args.zip:
+            shutil.rmtree(work_dir, ignore_errors=True)
         sys.exit(0)
 
-    # -----------------------------------------------------------------------
-    # STEP 5: Normalize each entry
-    # -----------------------------------------------------------------------
-    logging.info("--- Normalizing entries ---")
-    for entry in raw_entries:
-        extract_and_normalize(entry)
-        logging.debug(
-            f"  '{entry['raw_title']}' → clean='{entry['clean_title']}' "
-            f"year_hint={entry.get('year_hint')} source={entry.get('source')} "
-            f"filename='{entry['filename']}'"
-        )
-
-    # -----------------------------------------------------------------------
-    # STEP 6: Deduplicate
-    # -----------------------------------------------------------------------
-    logging.info("--- Deduplicating ---")
-    entries = deduplicate_entries(raw_entries)
-
-    # -----------------------------------------------------------------------
-    # STEP 7: Detect filename collisions
-    # -----------------------------------------------------------------------
-    logging.info("--- Checking for filename collisions ---")
-    entries = detect_filename_collisions(entries)
-
-    # -----------------------------------------------------------------------
-    # STEP 8: Enrich with Wikidata (optional)
-    # -----------------------------------------------------------------------
-    if not args.no_enrich:
-        if not HAS_REQUESTS:
-            logging.error(
-                "The 'requests' library is required for Wikidata enrichment. "
-                "Install it with: pip install requests\n"
-                "Or use --no-enrich to skip enrichment."
-            )
-            sys.exit(1)
-
-        logging.info("--- Enriching with Wikidata ---")
-        session = requests.Session()
-        session.headers.update({"User-Agent": USER_AGENT})
-
-        for i, entry in enumerate(entries, start=1):
-            logging.info(f"[{i}/{len(entries)}] Processing: '{entry['clean_title']}' [{entry['type']}]")
-            enrich_entry(
-                entry, session, covers_dir, covers_rel,
-                sleep_time=args.sleep, dry_run=args.dry_run,
-            )
-            # Throttle between items
-            if i < len(entries):
-                time.sleep(args.sleep)
-    else:
-        logging.info("--- Skipping enrichment (--no-enrich) ---")
-        for entry in entries:
-            entry.update({
-                "enriched": False,
-                "wikidata_qid": None,
-                "enriched_year": None,
-                "cover_filename": None,
-                "cover_source": None,
-                "cover_confidence": None,
-                "enriched_genres": [],
-                "skip_reason": "enrichment disabled",
-            })
-
-    # -----------------------------------------------------------------------
-    # STEP 9: Generate and write notes
-    # -----------------------------------------------------------------------
-    logging.info("--- Generating notes ---")
+    # Initialize variables used in the summary (in case of early exit)
+    entries = []
     written = 0
     skipped_exists = 0
+    zip_path = None
 
-    for entry in entries:
-        result = write_note(
-            entry, items_dir, covers_rel,
-            overwrite=args.overwrite, dry_run=args.dry_run,
-        )
-        if result:
-            written += 1
+    # -----------------------------------------------------------------------
+    # Wrap the pipeline in try/finally so that in --zip mode, the temp
+    # directory is always cleaned up — even on crash or dry-run.
+    # -----------------------------------------------------------------------
+    try:
+        # -----------------------------------------------------------------------
+        # STEP 5: Normalize each entry
+        # -----------------------------------------------------------------------
+        logging.info("--- Normalizing entries ---")
+        for entry in raw_entries:
+            extract_and_normalize(entry)
+            logging.debug(
+                f"  '{entry['raw_title']}' → clean='{entry['clean_title']}' "
+                f"year_hint={entry.get('year_hint')} source={entry.get('source')} "
+                f"filename='{entry['filename']}'"
+            )
+
+        # -----------------------------------------------------------------------
+        # STEP 6: Deduplicate
+        # -----------------------------------------------------------------------
+        logging.info("--- Deduplicating ---")
+        entries = deduplicate_entries(raw_entries)
+
+        # -----------------------------------------------------------------------
+        # STEP 7: Detect filename collisions
+        # -----------------------------------------------------------------------
+        logging.info("--- Checking for filename collisions ---")
+        entries = detect_filename_collisions(entries)
+
+        # -----------------------------------------------------------------------
+        # STEP 8: Enrich with Wikidata (optional)
+        # -----------------------------------------------------------------------
+        if not args.no_enrich:
+            if not HAS_REQUESTS:
+                logging.error(
+                    "The 'requests' library is required for Wikidata enrichment. "
+                    "Install it with: pip install requests\n"
+                    "Or use --no-enrich to skip enrichment."
+                )
+                sys.exit(1)
+
+            logging.info("--- Enriching with Wikidata ---")
+            session = requests.Session()
+            session.headers.update({"User-Agent": USER_AGENT})
+
+            for i, entry in enumerate(entries, start=1):
+                logging.info(f"[{i}/{len(entries)}] Processing: '{entry['clean_title']}' [{entry['type']}]")
+                enrich_entry(
+                    entry, session, covers_dir, covers_rel,
+                    sleep_time=args.sleep, dry_run=args.dry_run,
+                )
+                # Throttle between items
+                if i < len(entries):
+                    time.sleep(args.sleep)
         else:
-            skipped_exists += 1
+            logging.info("--- Skipping enrichment (--no-enrich) ---")
+            for entry in entries:
+                entry.update({
+                    "enriched": False,
+                    "wikidata_qid": None,
+                    "enriched_year": None,
+                    "cover_filename": None,
+                    "cover_source": None,
+                    "cover_confidence": None,
+                    "enriched_genres": [],
+                    "description": None,
+                    "source_url": None,
+                    "skip_reason": "enrichment disabled",
+                })
 
-    # -----------------------------------------------------------------------
-    # STEP 10: Create zip if requested
-    # -----------------------------------------------------------------------
-    if args.zip and not args.dry_run:
-        zip_name = f"media_enriched_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-        zip_path = Path.cwd() / zip_name
+        # -----------------------------------------------------------------------
+        # STEP 9: Generate and write notes
+        # -----------------------------------------------------------------------
+        logging.info("--- Generating notes ---")
 
-        logging.info(f"--- Creating zip: {zip_path} ---")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, dirs, files in os.walk(work_dir):
-                for file in files:
-                    file_path = Path(root) / file
-                    arcname = file_path.relative_to(work_dir)
-                    zf.write(file_path, arcname)
+        for entry in entries:
+            result = write_note(
+                entry, items_dir, covers_rel,
+                overwrite=args.overwrite, dry_run=args.dry_run,
+            )
+            if result:
+                written += 1
+            else:
+                skipped_exists += 1
 
-        logging.info(f"Zip created: {zip_path}")
+        # -----------------------------------------------------------------------
+        # STEP 9b: Clean up orphaned covers
+        # -----------------------------------------------------------------------
+        # A cover is orphaned if it was downloaded but the corresponding note
+        # was not written (e.g., note already existed, or write failed).
+        # We only clean up covers that THIS run downloaded but won't reference.
+        if not args.dry_run and covers_dir.is_dir():
+            referenced_covers = {
+                e["cover_filename"] for e in entries
+                if e.get("cover_filename")
+            }
+            for cover_file in covers_dir.iterdir():
+                if cover_file.is_file() and cover_file.name not in referenced_covers:
+                    # Only remove .tmp files left by interrupted downloads
+                    if cover_file.suffix == ".tmp":
+                        logging.info(f"  Cleaning up incomplete download: {cover_file.name}")
+                        cover_file.unlink(missing_ok=True)
 
-        # Clean up temp directory
-        shutil.rmtree(work_dir, ignore_errors=True)
+        # -----------------------------------------------------------------------
+        # STEP 10: Create zip if requested
+        # -----------------------------------------------------------------------
+        if args.zip and not args.dry_run:
+            zip_name = f"media_enriched_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            zip_path = Path.cwd() / zip_name
+
+            logging.info(f"--- Creating zip: {zip_path} ---")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _dirs, files in os.walk(work_dir):
+                    for file in files:
+                        file_path = Path(root) / file
+                        arcname = file_path.relative_to(work_dir)
+                        zf.write(file_path, arcname)
+
+            logging.info(f"Zip created: {zip_path}")
+
+    finally:
+        # Always clean up the temp directory in zip mode
+        if args.zip:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     # -----------------------------------------------------------------------
     # STEP 11: Summary report
@@ -1775,7 +1882,7 @@ def main():
         for t, counts in sorted(type_counts.items()):
             print(f"  {t:8s}: {counts['total']} total, {counts['enriched']} enriched, {counts['covers']} covers")
 
-    if args.zip and not args.dry_run:
+    if zip_path:
         print(f"\nOutput zip: {zip_path}")
     elif not args.dry_run:
         print(f"\nOutput dir: {items_dir}")

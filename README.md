@@ -11,25 +11,89 @@ A deterministic, script-driven tool for building an Obsidian media library from 
 - Python 3.10+
 - `requests` library (`pip install requests`)
 - macOS, Linux, or Windows (cross-platform filenames)
+- An internet connection (for Wikidata enrichment; not needed with `--no-enrich`)
 
-## Quick Start
+## Setup
 
 ```bash
-# Install dependency
-pip install requests
+# 1. Clone the repository
+git clone <repo-url>
+cd deterministic-media-metadata-generator
 
-# Dry run first (see what would be created, no files written)
+# 2. (Recommended) Create a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate   # macOS/Linux
+# .venv\Scripts\activate    # Windows
+
+# 3. Install the single dependency
+pip install requests
+```
+
+## Running the Script
+
+### Step-by-step: First run
+
+```bash
+# 1. Create your input file (see "Input Format" below for structure)
+#    The file must have ## section headers for each media type.
+
+# 2. Always start with a dry run to preview what will be created:
 python3 enrich_media.py --input my_media.md --vault ~/my-vault --dry-run
 
-# Process only movies
-python3 enrich_media.py --input my_media.md --vault ~/my-vault --only movies
+#    This prints what notes WOULD be written without touching the filesystem.
+#    Review the output in your terminal. Check for title normalization issues.
 
-# Full run, all types, zip output
+# 3. Run for real, one type at a time (recommended):
+python3 enrich_media.py \
+  --input my_media.md \
+  --vault ~/my-vault \
+  --only movies \
+  --out-items media/items
+
+#    This writes movie notes to ~/my-vault/media/items/
+#    and cover images to ~/my-vault/media/covers/
+
+# 4. Open your vault in Obsidian and review the generated notes.
+#    Then repeat for other types:
+python3 enrich_media.py -i my_media.md -v ~/my-vault --only shows --out-items media/items
+python3 enrich_media.py -i my_media.md -v ~/my-vault --only books --out-items media/items
+python3 enrich_media.py -i my_media.md -v ~/my-vault --only games --out-items media/items
+```
+
+### Common run patterns
+
+```bash
+# Process all types at once (notes go to a timestamped folder):
+python3 enrich_media.py --input my_media.md --vault ~/my-vault
+
+# Process all types into a specific folder:
+python3 enrich_media.py --input my_media.md --vault ~/my-vault --out-items media/items
+
+# Skip Wikidata enrichment (just normalize + generate stub notes):
+python3 enrich_media.py --input my_media.md --vault ~/my-vault --no-enrich
+
+# Package output as a zip instead of writing directly to vault:
 python3 enrich_media.py --input my_media.md --vault ~/my-vault --zip
 
-# Without enrichment (just normalize + generate stubs)
-python3 enrich_media.py --input my_media.md --vault ~/my-vault --no-enrich
+# Overwrite existing notes (by default, existing notes are skipped):
+python3 enrich_media.py --input my_media.md --vault ~/my-vault --overwrite
+
+# Verbose logging (shows SPARQL queries, confidence scores, etc.):
+python3 enrich_media.py --input my_media.md --vault ~/my-vault --verbose
+
+# Slow down Wikidata requests if you're getting rate-limited:
+python3 enrich_media.py --input my_media.md --vault ~/my-vault --sleep 1.0
 ```
+
+### Where output goes
+
+| Output | Default path | Override with |
+|---|---|---|
+| Notes | `<vault>/media/items_enriched_<YYYYMMDD_HHMMSS>/` | `--out-items <relative-path>` |
+| Cover images | `<vault>/media/covers/` | `--out-covers <relative-path>` |
+| Zip (if `--zip`) | `./media_enriched_<YYYYMMDD_HHMMSS>.zip` | — |
+
+Paths for `--out-items` and `--out-covers` are **relative to the vault root**, not absolute.
 
 ## CLI Reference
 
@@ -58,7 +122,7 @@ Claim Your Inner Child (from Merija).md
 1984
 
 ## SHOWS
-The Mandalorian (from Anton).md=
+The Mandalorian (from Anton).md
 
 ## MOVIES
 Redline (2009).md
@@ -89,6 +153,8 @@ source: from Anton
 cover: "[[media/covers/redline-2009.jpg]]"
 cover_source: wikidata
 cover_confidence: high
+description: "2009 Japanese animated science fiction film"
+source_url: "https://en.wikipedia.org/wiki/Redline_(2009_film)"
 wikidata: Q1234567
 ---
 
@@ -96,7 +162,18 @@ wikidata: Q1234567
 ```
 
 **Always-present keys:** `type`, `status`, `priority`, `year`, `genre`, `mood`
-**Conditional keys:** `source`, `cover`, `cover_source`, `cover_confidence`, `wikidata`
+
+**Conditional keys (only when data is available):**
+
+| Key | When present | Source |
+|---|---|---|
+| `source` | Entry had a `(from X)` annotation | Input file |
+| `cover` | Wikidata P18 image downloaded successfully | Wikimedia Commons |
+| `cover_source` | Cover was downloaded | Always `wikidata` |
+| `cover_confidence` | Cover was downloaded | `high` (exact match) or `medium` |
+| `description` | Wikidata has an English description | Wikidata `schema:description` |
+| `source_url` | Wikipedia article or Wikidata page exists | English Wikipedia or Wikidata fallback |
+| `wikidata` | Enrichment matched a Wikidata item | Wikidata QID |
 
 ## Title Normalization Rules
 
@@ -155,23 +232,40 @@ Covers are downloaded from Wikimedia Commons (via Wikidata's P18 property):
 
 **No fake URLs.** If download fails, the cover field is omitted entirely.
 
+## Error Handling
+
+The script is designed to fail gracefully at every stage:
+
+- **Network errors** (timeout, connection refused): Logged as warnings, entry skipped, processing continues.
+- **Wikidata rate limiting (429)**: Backs off 5 seconds and retries. If persistent, increase `--sleep`.
+- **No Wikidata match**: Entry gets a stub note with no enrichment — never crashes.
+- **Ambiguous match**: Both candidates rejected, entry gets a stub note.
+- **Cover download failure**: Note is written without a cover field. No broken references.
+- **Partial cover download**: Uses atomic temp-file-then-rename to prevent corrupt images on disk.
+- **File write failure** (permissions, disk full): Logged as warning, entry skipped, processing continues.
+- **Missing `requests` library**: Clear error message with install instructions. `--dry-run` and `--no-enrich` work without it.
+- **Missing description or Wikipedia link**: Fields simply omitted from the note. Falls back to Wikidata URL when no Wikipedia article exists.
+
 ## Recommended Workflow
 
 Process one type at a time for easier review:
 
 ```bash
-# Step 1: Movies first
+# Step 1: Dry run to check normalization
+python3 enrich_media.py -i media.md -v ~/vault --dry-run
+
+# Step 2: Movies first
 python3 enrich_media.py -i media.md -v ~/vault --only movies --out-items media/items
 
-# Step 2: Review the movie notes, fix any issues
+# Step 3: Review the movie notes in Obsidian, fix any issues
 
-# Step 3: Shows
+# Step 4: Shows
 python3 enrich_media.py -i media.md -v ~/vault --only shows --out-items media/items
 
-# Step 4: Books
+# Step 5: Books
 python3 enrich_media.py -i media.md -v ~/vault --only books --out-items media/items
 
-# Step 5: Games
+# Step 6: Games
 python3 enrich_media.py -i media.md -v ~/vault --only games --out-items media/items
 ```
 
@@ -186,6 +280,7 @@ Note: When using a fixed `--out-items` path across runs, existing notes are **sk
 - **Filename collisions:** Resolved with short hash suffix when two different items produce the same slug
 - **Multiple spaces:** Collapsed (`Sea  of Stars` → `Sea of Stars`)
 - **Informal annotations:** `, lol`, `?`, etc. stripped from titles
+- **Cross-type collisions:** If "Safe" exists as a movie note, the show version writes to `safe-show.md`
 
 ## Troubleshooting
 
@@ -196,3 +291,7 @@ Note: When using a fixed `--out-items` path across runs, existing notes are **sk
 **"requests not found"** — Run `pip install requests` (or `pip3 install requests`).
 
 **Covers not rendering in Obsidian** — Ensure the cover path in YAML matches the actual file location relative to vault root. The wikilink format `"[[media/covers/file.jpg]]"` should work in most Obsidian setups.
+
+**Notes written but empty metadata** — This means Wikidata enrichment was skipped (low confidence or no match). Check `--verbose` output for scoring details. Adding a year hint to your input (e.g., `Redline (2009)`) dramatically improves match accuracy.
+
+**"Failed to write note"** — Check filesystem permissions and available disk space in your vault directory.
