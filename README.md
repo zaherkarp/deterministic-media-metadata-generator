@@ -95,6 +95,15 @@ python3 enrich_media.py --input my_media.md --vault ~/my-vault --sleep 1.0
 
 Paths for `--out-items` and `--out-covers` are **relative to the vault root**, not absolute.
 
+**Important:** If your vault path contains spaces (common with iCloud-synced vaults), wrap it in quotes:
+
+```bash
+python3 enrich_media.py \
+  --input media_list.md \
+  --vault "/Users/you/Library/Mobile Documents/iCloud~md~obsidian/Documents/MyVault" \
+  --out-items media/items
+```
+
 ## CLI Reference
 
 | Argument | Required | Default | Description |
