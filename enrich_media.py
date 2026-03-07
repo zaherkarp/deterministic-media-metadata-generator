@@ -222,6 +222,7 @@ USER_AGENT = (
 
 # --- TMDb API Settings ---
 TMDB_API_BASE = "https://api.themoviedb.org/3"
+TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 TMDB_WATCH_PROVIDER_TYPES = ["flatrate", "rent", "buy", "free", "ads"]
 TMDB_WATCH_PROVIDER_TYPE_LABELS = {
     "flatrate": "subscription",
@@ -230,6 +231,9 @@ TMDB_WATCH_PROVIDER_TYPE_LABELS = {
     "free": "free",
     "ads": "ads",
 }
+
+# --- Open Library API Settings ---
+OPENLIBRARY_COVERS_BASE = "https://covers.openlibrary.org/b/olid"
 
 # --- Logging Setup ---
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
@@ -1292,6 +1296,169 @@ def download_cover(
         return None
 
 
+def fetch_tmdb_poster(
+    tmdb_id: str,
+    media_type: str,
+    tmdb_key: str,
+    cover_slug: str,
+    covers_dir: Path,
+    session: "requests.Session",
+    dry_run: bool = False,
+) -> Optional[str]:
+    """
+    Fetch a poster image from TMDb as a cover fallback.
+
+    Used when the Wikidata entry has no P18 image but does have a TMDb ID.
+    TMDb has poster images for virtually every movie and TV show.
+
+    PARAMETERS:
+        tmdb_id:    TMDb numeric ID
+        media_type: "movie" or "show"
+        tmdb_key:   TMDb API v3 key
+        cover_slug: Local filename slug
+        covers_dir: Output directory for covers
+        session:    requests.Session
+        dry_run:    If True, simulate only
+
+    RETURNS:
+        Local filename if successful, None otherwise.
+    """
+    tmdb_type = "tv" if media_type == "show" else "movie"
+    url = f"{TMDB_API_BASE}/{tmdb_type}/{tmdb_id}"
+
+    try:
+        resp = session.get(
+            url,
+            params={"api_key": tmdb_key},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            logging.debug(f"  TMDb details lookup failed: {resp.status_code}")
+            return None
+
+        data = resp.json()
+        poster_path = data.get("poster_path")
+        if not poster_path:
+            logging.debug(f"  TMDb: no poster for {tmdb_type}/{tmdb_id}")
+            return None
+
+        # Download the poster image
+        poster_url = f"{TMDB_IMAGE_BASE}{poster_path}"
+        ext = Path(poster_path).suffix.lower() or ".jpg"
+        local_filename = f"{cover_slug}{ext}"
+        local_path = covers_dir / local_filename
+
+        if dry_run:
+            logging.info(f"  [DRY-RUN] Would download TMDb poster: {local_filename}")
+            return local_filename
+
+        if local_path.exists():
+            logging.info(f"  TMDb poster already exists: {local_filename}")
+            return local_filename
+
+        covers_dir.mkdir(parents=True, exist_ok=True)
+        img_resp = session.get(poster_url, timeout=REQUEST_TIMEOUT, stream=True)
+        img_resp.raise_for_status()
+
+        tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+        try:
+            with open(tmp_path, "wb") as f:
+                for chunk in img_resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            file_size = tmp_path.stat().st_size
+            if file_size < 1000:
+                logging.warning(f"  TMDb poster suspiciously small ({file_size} bytes)")
+                tmp_path.unlink(missing_ok=True)
+                return None
+
+            tmp_path.rename(local_path)
+            logging.info(f"  Downloaded TMDb poster: {local_filename} ({file_size:,} bytes)")
+            return local_filename
+        except OSError as e:
+            logging.warning(f"  TMDb poster write failed: {e}")
+            tmp_path.unlink(missing_ok=True)
+            return None
+
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  TMDb poster fetch failed: {e}")
+        return None
+
+
+def fetch_openlibrary_cover(
+    ol_id: str,
+    cover_slug: str,
+    covers_dir: Path,
+    session: "requests.Session",
+    dry_run: bool = False,
+) -> Optional[str]:
+    """
+    Fetch a book cover from Open Library as a cover fallback.
+
+    Uses the Open Library Covers API which serves cover images by OLID.
+    No API key required.
+
+    PARAMETERS:
+        ol_id:      Open Library work ID (e.g., "OL45883W")
+        cover_slug: Local filename slug
+        covers_dir: Output directory for covers
+        session:    requests.Session
+        dry_run:    If True, simulate only
+
+    RETURNS:
+        Local filename if successful, None otherwise.
+    """
+    # Open Library covers API: /b/olid/{OLID}-M.jpg  (M = medium size)
+    cover_url = f"{OPENLIBRARY_COVERS_BASE}/{ol_id}-M.jpg"
+    local_filename = f"{cover_slug}.jpg"
+    local_path = covers_dir / local_filename
+
+    if dry_run:
+        logging.info(f"  [DRY-RUN] Would download Open Library cover: {local_filename}")
+        return local_filename
+
+    if local_path.exists():
+        logging.info(f"  Open Library cover already exists: {local_filename}")
+        return local_filename
+
+    try:
+        resp = session.get(cover_url, timeout=REQUEST_TIMEOUT, stream=True)
+        if resp.status_code != 200:
+            logging.debug(f"  Open Library cover not found for {ol_id}")
+            return None
+
+        content_type = resp.headers.get("Content-Type", "")
+        if "image" not in content_type:
+            logging.debug(f"  Open Library returned non-image: {content_type}")
+            return None
+
+        covers_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = local_path.with_suffix(".jpg.tmp")
+        try:
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            file_size = tmp_path.stat().st_size
+            if file_size < 1000:
+                # Open Library returns a 1x1 pixel placeholder for missing covers
+                logging.debug(f"  Open Library cover too small ({file_size} bytes), skipping")
+                tmp_path.unlink(missing_ok=True)
+                return None
+
+            tmp_path.rename(local_path)
+            logging.info(f"  Downloaded Open Library cover: {local_filename} ({file_size:,} bytes)")
+            return local_filename
+        except OSError as e:
+            logging.warning(f"  Open Library cover write failed: {e}")
+            tmp_path.unlink(missing_ok=True)
+            return None
+
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  Open Library cover fetch failed: {e}")
+        return None
+
+
 def lookup_tmdb_streaming(
     tmdb_id: str,
     media_type: str,
@@ -1546,19 +1713,46 @@ def enrich_entry(
             )
             entry["enriched_year"] = year_hint
 
-    # Cover: download if available
+    # Cover: download if available (try Wikidata P18 first, then fallbacks)
+    cover_slug = generate_slug_for_cover(title, entry["enriched_year"] or year_hint)
+
+    # Try 1: Wikidata P18 image (highest quality, directly from Commons)
     if winner.get("image_filename"):
-        cover_slug = generate_slug_for_cover(title, entry["enriched_year"] or year_hint)
         cover_fn = download_cover(
             winner["image_filename"], cover_slug, covers_dir, session, dry_run
         )
         if cover_fn:
             entry["cover_filename"] = cover_fn
             entry["cover_source"] = "wikidata"
-            # Confidence: high if exact label match and year match, else medium
             if winner["score_breakdown"].get("exact_label"):
                 entry["cover_confidence"] = "high"
             else:
+                entry["cover_confidence"] = "medium"
+
+    # Try 2: TMDb poster (movies/shows — requires API key)
+    if not entry.get("cover_filename") and tmdb_key and media_type in ("movie", "show"):
+        tmdb_id = winner.get("tmdb_movie_id") if media_type == "movie" else winner.get("tmdb_tv_id")
+        if tmdb_id:
+            time.sleep(sleep_time)
+            cover_fn = fetch_tmdb_poster(
+                tmdb_id, media_type, tmdb_key, cover_slug, covers_dir, session, dry_run
+            )
+            if cover_fn:
+                entry["cover_filename"] = cover_fn
+                entry["cover_source"] = "tmdb"
+                entry["cover_confidence"] = "high"
+
+    # Try 3: Open Library cover (books — no API key needed)
+    if not entry.get("cover_filename") and media_type == "book":
+        ol_id = winner.get("open_library_id")
+        if ol_id:
+            time.sleep(sleep_time)
+            cover_fn = fetch_openlibrary_cover(
+                ol_id, cover_slug, covers_dir, session, dry_run
+            )
+            if cover_fn:
+                entry["cover_filename"] = cover_fn
+                entry["cover_source"] = "openlibrary"
                 entry["cover_confidence"] = "medium"
 
     # Genres: only 1-2, only if specific and unambiguous
@@ -1982,8 +2176,10 @@ EXAMPLES:
         "--tmdb-key",
         default=None,
         help=(
-            "TMDb API key (v3) for streaming availability lookups. "
-            "Also reads from TMDB_API_KEY environment variable."
+            "TMDb API key (v3) for poster covers and streaming lookups. "
+            "Also reads from TMDB_API_KEY environment variable. "
+            "When provided, TMDb posters are used as cover fallback for "
+            "movies/shows that lack Wikidata images."
         ),
     )
     parser.add_argument(
