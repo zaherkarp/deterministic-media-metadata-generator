@@ -101,20 +101,27 @@ WIKIDATA_TYPE_QIDS = {
         "Q24862",     # short film
         "Q336144",    # animated feature film (often used for anime films)
         "Q202866",    # animated film
+        "Q20650540",  # anime film (WikiProject Anime standard)
+        "Q29168811",  # animated feature film (alternate, widely used)
         "Q229390",    # 3D film
-        "Q226730",    # OVA (original video animation — often single-episode)
+        "Q226730",    # OVA (original video animation — single-episode)
         "Q20667187",  # animated short film
         "Q506240",    # television film
+        "Q98807719",  # animated television film
     ],
     "show": [
         "Q5398426",   # television series
         "Q581714",    # animated series
         "Q21191270",  # television series episode (rare but possible)
         "Q63952888",  # anime television series
+        "Q11086742",  # anime television program (broader)
         "Q1259759",   # television special
+        "Q123126551", # animated television special
         "Q526877",    # web series
         "Q21188109",  # web television series
-        "Q220898",    # ONA (original net animation)
+        "Q1047299",   # ONA (original net animation)
+        "Q113671041", # ONA series
+        "Q220898",    # OVA (original video animation — multi-episode)
     ],
     "game": [
         "Q7889",      # video game
