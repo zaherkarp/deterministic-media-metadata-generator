@@ -702,7 +702,8 @@ def build_sparql_query(title: str, media_type: str) -> str:
     # and that are instances of the correct media type. We fetch additional
     # properties for scoring.
     query = f"""
-    SELECT DISTINCT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article WHERE {{
+    SELECT DISTINCT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article
+                    ?tmdbMovieId ?tmdbTvId ?openLibraryId ?steamId WHERE {{
       # --- Find items whose label matches our search title ---
       # We use case-insensitive matching via FILTER + LCASE
       ?item rdfs:label ?label .
@@ -764,7 +765,8 @@ def build_sparql_query_fuzzy(title: str, media_type: str) -> str:
     escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
 
     query = f"""
-    SELECT DISTINCT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article WHERE {{
+    SELECT DISTINCT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article
+                    ?tmdbMovieId ?tmdbTvId ?openLibraryId ?steamId WHERE {{
       ?item rdfs:label ?label .
       FILTER(LANG(?label) = "en")
       FILTER(CONTAINS(LCASE(?label), LCASE("{escaped_title}")))
