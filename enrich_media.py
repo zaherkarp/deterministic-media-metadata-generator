@@ -100,16 +100,27 @@ WIKIDATA_TYPE_QIDS = {
         "Q11424",     # film
         "Q24862",     # short film
         "Q336144",    # animated feature film (often used for anime films)
+        "Q202866",    # animated film
+        "Q229390",    # 3D film
+        "Q226730",    # OVA (original video animation — often single-episode)
+        "Q20667187",  # animated short film
+        "Q506240",    # television film
     ],
     "show": [
         "Q5398426",   # television series
         "Q581714",    # animated series
         "Q21191270",  # television series episode (rare but possible)
         "Q63952888",  # anime television series
+        "Q1259759",   # television special
+        "Q526877",    # web series
+        "Q21188109",  # web television series
+        "Q220898",    # ONA (original net animation)
     ],
     "game": [
         "Q7889",      # video game
         "Q21125433",  # video game remake (some newer entries)
+        "Q56196027",  # mobile game
+        "Q848991",    # browser game
     ],
 }
 
@@ -155,7 +166,7 @@ ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 # These control how aggressive or conservative we are in accepting Wikidata matches.
 # Score components are additive; we require total >= ACCEPT_THRESHOLD.
 CONFIDENCE = {
-    "ACCEPT_THRESHOLD": 3,       # minimum score to accept a Wikidata match
+    "ACCEPT_THRESHOLD": 2,       # minimum score to accept a Wikidata match
     "EXACT_LABEL_BONUS": 3,      # exact label match (case-insensitive)
     "CLOSE_LABEL_BONUS": 2,      # label matches after normalization
     "YEAR_MATCH_BONUS": 2,       # year from Wikidata matches our year hint
@@ -493,8 +504,24 @@ def extract_and_normalize(entry: dict) -> dict:
     # -----------------------------------------------------------------------
     search_title = re.sub(r'\s*\([^)]*\)\s*', ' ', title).strip()
     search_title = re.sub(r'\s+', ' ', search_title)
+    # Clean up orphaned colons left after parenthetical stripping
+    # e.g. "Living (2022): Ikiru remake" → strip parens → "Living : Ikiru remake"
+    search_title = re.sub(r'\s*:\s*', ': ', search_title).strip()
+    search_title = re.sub(r'^:\s*', '', search_title)
+    search_title = re.sub(r'\s*:$', '', search_title)
     if not search_title:
         search_title = title  # fallback if stripping removed everything
+
+    # Also strip colon-suffixed user annotations from search_title.
+    # Real subtitles typically have Title Case ("Frieren: Beyond Journey's End")
+    # while user annotations are all lowercase ("Inherit the Wind: old drama").
+    # Heuristic: if the part after the LAST colon starts with a lowercase letter,
+    # it's likely a user comment, not a real subtitle.
+    if ':' in search_title:
+        before_colon, _, after_colon = search_title.rpartition(':')
+        after_stripped = after_colon.strip()
+        if before_colon.strip() and after_stripped and after_stripped[0].islower():
+            search_title = before_colon.strip()
 
     # -----------------------------------------------------------------------
     # RETURN: Enriched entry with all extracted metadata
