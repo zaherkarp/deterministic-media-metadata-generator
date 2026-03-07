@@ -667,13 +667,35 @@ def detect_filename_collisions(entries: list[dict]) -> list[dict]:
 # This section handles querying Wikidata's SPARQL endpoint for metadata,
 # scoring candidates, and making conservative accept/reject decisions.
 
+def _platform_optionals(media_type: str) -> str:
+    """Return only the OPTIONAL platform-ID clauses relevant to *media_type*.
+
+    Keeps the query plan small by not asking Wikidata to probe properties
+    that can never match (e.g. Steam ID for a book).
+    """
+    clauses: list[str] = []
+    if media_type == "movie":
+        clauses.append("OPTIONAL { ?item wdt:P4983 ?tmdbMovieId . }")
+    elif media_type == "show":
+        clauses.append("OPTIONAL { ?item wdt:P4947 ?tmdbTvId . }")
+    elif media_type == "book":
+        clauses.append("OPTIONAL { ?item wdt:P5331 ?openLibraryId . }")
+    elif media_type == "game":
+        clauses.append("OPTIONAL { ?item wdt:P1733 ?steamId . }")
+    return "\n      ".join(clauses)
+
+
 def build_sparql_query(title: str, media_type: str) -> str:
     """
     Build a SPARQL query to search Wikidata for candidates matching a title.
 
     APPROACH:
-        We use the Wikidata label service (wikibase:label) and search by
-        rdfs:label with a case-insensitive filter. We also fetch:
+        We use the MediaWiki full-text search API (mwapi:search) to find
+        candidate items quickly via an indexed lookup, then narrow by
+        instance-of type and exact label match.  This avoids a full scan
+        of rdfs:label which causes timeouts on the public endpoint.
+
+        We fetch:
         - P577 (publication date / release date)
         - P18 (image)
         - P136 (genre)
@@ -697,17 +719,29 @@ def build_sparql_query(title: str, media_type: str) -> str:
     # Replace backslashes first, then quotes
     escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
 
+    platform_clauses = _platform_optionals(media_type)
+
     # Build the query
-    # STRATEGY: We search for items whose label matches our title (case-insensitive)
-    # and that are instances of the correct media type. We fetch additional
-    # properties for scoring.
+    # STRATEGY: Use the MediaWiki API full-text search service to find items
+    # by title (indexed, fast), then confirm the label matches exactly and
+    # check the instance-of type.  Metadata is fetched in a small subquery
+    # so OPTIONAL blocks don't create a cartesian explosion.
     query = f"""
-    SELECT DISTINCT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article
-                    ?tmdbMovieId ?tmdbTvId ?openLibraryId ?steamId WHERE {{
-      # --- Find items whose label matches our search title ---
-      # We use case-insensitive matching via FILTER + LCASE
+    SELECT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article
+           ?tmdbMovieId ?tmdbTvId ?openLibraryId ?steamId WHERE {{
+      # --- Fast indexed lookup via MediaWiki search ---
+      SERVICE wikibase:mwapi {{
+        bd:serviceParam wikibase:endpoint "www.wikidata.org" ;
+                        wikibase:api "EntitySearch" ;
+                        mwapi:search "{escaped_title}" ;
+                        mwapi:language "en" .
+        ?item wikibase:apiOutputItem mwapi:item .
+      }}
+
+      # --- Confirm exact label match (case-insensitive) ---
       ?item rdfs:label ?label .
-      FILTER(LCASE(?label) = LCASE("{escaped_title}"@en))
+      FILTER(LANG(?label) = "en")
+      FILTER(LCASE(?label) = LCASE("{escaped_title}"))
 
       # --- Filter by media type (instance-of) ---
       VALUES ?type {{ {type_values} }}
@@ -719,10 +753,8 @@ def build_sparql_query(title: str, media_type: str) -> str:
       # --- Optional: image (P18) ---
       OPTIONAL {{ ?item wdt:P18 ?image . }}
 
-      # --- Optional: genre (P136) ---
-      OPTIONAL {{ ?item wdt:P136 ?genre .
-                 ?genre rdfs:label ?genreLabel .
-                 FILTER(LANG(?genreLabel) = "en") }}
+      # --- Optional: genre (P136) — use label service, not manual join ---
+      OPTIONAL {{ ?item wdt:P136 ?genre . }}
 
       # --- Optional: description (schema:description) ---
       OPTIONAL {{ ?item schema:description ?description .
@@ -732,13 +764,10 @@ def build_sparql_query(title: str, media_type: str) -> str:
       OPTIONAL {{ ?article schema:about ?item ;
                           schema:isPartOf <https://en.wikipedia.org/> . }}
 
-      # --- Optional: platform IDs for streaming/availability ---
-      OPTIONAL {{ ?item wdt:P4983 ?tmdbMovieId . }}   # TMDb movie ID
-      OPTIONAL {{ ?item wdt:P4947 ?tmdbTvId . }}       # TMDb TV series ID
-      OPTIONAL {{ ?item wdt:P5331 ?openLibraryId . }}  # Open Library work ID
-      OPTIONAL {{ ?item wdt:P1733 ?steamId . }}         # Steam application ID
+      # --- Optional: platform IDs (only the ones relevant to this type) ---
+      {platform_clauses}
 
-      # --- Get English labels ---
+      # --- Get English labels (also resolves ?genre → ?genreLabel) ---
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,mul". }}
     }}
     LIMIT 10
@@ -748,11 +777,13 @@ def build_sparql_query(title: str, media_type: str) -> str:
 
 def build_sparql_query_fuzzy(title: str, media_type: str) -> str:
     """
-    Build a FALLBACK SPARQL query using CONTAINS for fuzzy matching.
+    Build a FALLBACK SPARQL query using the MediaWiki search service.
 
     This is used when the exact-match query returns no results.
-    It's less precise but catches cases where Wikidata's label differs slightly
-    from our normalized title (e.g., "The Mandalorian" vs "Mandalorian").
+    Instead of the old CONTAINS-over-all-labels approach (which caused
+    timeouts), we reuse the indexed mwapi EntitySearch but drop the
+    exact-label-match filter, so near-misses (e.g. "The Mandalorian"
+    vs "Mandalorian") can still be found.
 
     CAUTION: Fuzzy queries return more false positives, so we apply stricter
     confidence gating on these results.
@@ -764,23 +795,27 @@ def build_sparql_query_fuzzy(title: str, media_type: str) -> str:
     type_values = " ".join(f"wd:{qid}" for qid in type_qids)
     escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
 
-    query = f"""
-    SELECT DISTINCT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article
-                    ?tmdbMovieId ?tmdbTvId ?openLibraryId ?steamId WHERE {{
-      ?item rdfs:label ?label .
-      FILTER(LANG(?label) = "en")
-      FILTER(CONTAINS(LCASE(?label), LCASE("{escaped_title}")))
+    platform_clauses = _platform_optionals(media_type)
 
+    query = f"""
+    SELECT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article
+           ?tmdbMovieId ?tmdbTvId ?openLibraryId ?steamId WHERE {{
+      # --- Fast indexed lookup (fuzzy — no exact-match filter) ---
+      SERVICE wikibase:mwapi {{
+        bd:serviceParam wikibase:endpoint "www.wikidata.org" ;
+                        wikibase:api "EntitySearch" ;
+                        mwapi:search "{escaped_title}" ;
+                        mwapi:language "en" .
+        ?item wikibase:apiOutputItem mwapi:item .
+      }}
+
+      # --- Filter by media type (instance-of) ---
       VALUES ?type {{ {type_values} }}
       ?item wdt:P31 ?type .
 
       OPTIONAL {{ ?item wdt:P577 ?date . }}
       OPTIONAL {{ ?item wdt:P18 ?image . }}
-      OPTIONAL {{
-        ?item wdt:P136 ?genre .
-        ?genre rdfs:label ?genreLabel .
-        FILTER(LANG(?genreLabel) = "en")
-      }}
+      OPTIONAL {{ ?item wdt:P136 ?genre . }}
 
       # --- Optional: description ---
       OPTIONAL {{ ?item schema:description ?description .
@@ -790,11 +825,8 @@ def build_sparql_query_fuzzy(title: str, media_type: str) -> str:
       OPTIONAL {{ ?article schema:about ?item ;
                           schema:isPartOf <https://en.wikipedia.org/> . }}
 
-      # --- Optional: platform IDs for streaming/availability ---
-      OPTIONAL {{ ?item wdt:P4983 ?tmdbMovieId . }}
-      OPTIONAL {{ ?item wdt:P4947 ?tmdbTvId . }}
-      OPTIONAL {{ ?item wdt:P5331 ?openLibraryId . }}
-      OPTIONAL {{ ?item wdt:P1733 ?steamId . }}
+      # --- Optional: platform IDs (only relevant ones) ---
+      {platform_clauses}
 
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,mul". }}
     }}
