@@ -16,6 +16,13 @@ DESIGN PHILOSOPHY:
     - NO HALLUCINATION: All metadata comes from verified Wikidata queries.
       Covers are real downloaded files or omitted entirely.
 
+STREAMING AVAILABILITY:
+    When --streaming is passed, the script adds platform/availability data:
+    - Movies/Shows: Uses TMDb watch/providers API (requires --tmdb-key or
+      TMDB_API_KEY env var) for streaming/rent/buy info per country.
+    - Books: Fetches Open Library Work ID (P5331) from Wikidata — no key needed.
+    - Games: Fetches Steam App ID (P1733) from Wikidata — no key needed.
+
 USAGE:
     python3 enrich_media.py --input media_list.md --vault ~/my-vault
     python3 enrich_media.py --input media_list.md --vault ~/my-vault --only movies
@@ -177,6 +184,17 @@ USER_AGENT = (
     "(https://github.com/example; media-library-tool) "
     "python-requests"
 )
+
+# --- TMDb API Settings ---
+TMDB_API_BASE = "https://api.themoviedb.org/3"
+TMDB_WATCH_PROVIDER_TYPES = ["flatrate", "rent", "buy", "free", "ads"]
+TMDB_WATCH_PROVIDER_TYPE_LABELS = {
+    "flatrate": "subscription",
+    "rent": "rent",
+    "buy": "buy",
+    "free": "free",
+    "ads": "ads",
+}
 
 # --- Logging Setup ---
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
@@ -713,6 +731,12 @@ def build_sparql_query(title: str, media_type: str) -> str:
       OPTIONAL {{ ?article schema:about ?item ;
                           schema:isPartOf <https://en.wikipedia.org/> . }}
 
+      # --- Optional: platform IDs for streaming/availability ---
+      OPTIONAL {{ ?item wdt:P4983 ?tmdbMovieId . }}   # TMDb movie ID
+      OPTIONAL {{ ?item wdt:P4947 ?tmdbTvId . }}       # TMDb TV series ID
+      OPTIONAL {{ ?item wdt:P5331 ?openLibraryId . }}  # Open Library work ID
+      OPTIONAL {{ ?item wdt:P1733 ?steamId . }}         # Steam application ID
+
       # --- Get English labels ---
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,mul". }}
     }}
@@ -763,6 +787,12 @@ def build_sparql_query_fuzzy(title: str, media_type: str) -> str:
       # --- Optional: English Wikipedia article link ---
       OPTIONAL {{ ?article schema:about ?item ;
                           schema:isPartOf <https://en.wikipedia.org/> . }}
+
+      # --- Optional: platform IDs for streaming/availability ---
+      OPTIONAL {{ ?item wdt:P4983 ?tmdbMovieId . }}
+      OPTIONAL {{ ?item wdt:P4947 ?tmdbTvId . }}
+      OPTIONAL {{ ?item wdt:P5331 ?openLibraryId . }}
+      OPTIONAL {{ ?item wdt:P1733 ?steamId . }}
 
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,mul". }}
     }}
@@ -933,6 +963,20 @@ def score_candidate(
     if article_val:
         result["source_url"] = article_val
 
+    # --- Extract: platform IDs (for streaming/availability) ---
+    tmdb_movie_id = candidate.get("tmdbMovieId", {}).get("value", "")
+    if tmdb_movie_id:
+        result["tmdb_movie_id"] = tmdb_movie_id
+    tmdb_tv_id = candidate.get("tmdbTvId", {}).get("value", "")
+    if tmdb_tv_id:
+        result["tmdb_tv_id"] = tmdb_tv_id
+    open_library_id = candidate.get("openLibraryId", {}).get("value", "")
+    if open_library_id:
+        result["open_library_id"] = open_library_id
+    steam_id = candidate.get("steamId", {}).get("value", "")
+    if steam_id:
+        result["steam_id"] = steam_id
+
     # --- Fuzzy query penalty ---
     if is_fuzzy:
         result["score"] += CONFIDENCE["AMBIGUITY_PENALTY"]
@@ -994,6 +1038,10 @@ def merge_candidates(raw_bindings: list[dict], title: str, year_hint: Optional[i
                 existing["description"] = scored["description"]
             if not existing["source_url"] and scored["source_url"]:
                 existing["source_url"] = scored["source_url"]
+            # Carry over platform IDs
+            for pid_key in ("tmdb_movie_id", "tmdb_tv_id", "open_library_id", "steam_id"):
+                if not existing.get(pid_key) and scored.get(pid_key):
+                    existing[pid_key] = scored[pid_key]
 
     candidates = list(by_qid.values())
     candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -1131,6 +1179,85 @@ def download_cover(
         return None
 
 
+def lookup_tmdb_streaming(
+    tmdb_id: str,
+    media_type: str,
+    tmdb_key: str,
+    country: str,
+    session: "requests.Session",
+) -> list[dict]:
+    """
+    Look up streaming/rent/buy availability via TMDb's watch/providers API.
+
+    TMDb's watch/providers data is sourced from JustWatch and provides
+    per-country availability across streaming platforms.
+
+    PARAMETERS:
+        tmdb_id:    The TMDb ID (numeric string)
+        media_type: "movie" or "show" (show maps to TMDb's "tv" endpoint)
+        tmdb_key:   TMDb API key (v3 auth)
+        country:    ISO 3166-1 alpha-2 country code (e.g., "US", "GB")
+        session:    requests.Session for HTTP
+
+    RETURNS:
+        List of dicts: [{"provider": "Netflix", "type": "subscription"}, ...]
+        Empty list on any error or if no data for the given country.
+    """
+    # Map our type to TMDb endpoint path
+    tmdb_type = "tv" if media_type == "show" else "movie"
+    url = f"{TMDB_API_BASE}/{tmdb_type}/{tmdb_id}/watch/providers"
+
+    try:
+        resp = session.get(
+            url,
+            params={"api_key": tmdb_key},
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        if resp.status_code == 404:
+            logging.debug(f"  TMDb: no watch/providers for {tmdb_type}/{tmdb_id}")
+            return []
+
+        if resp.status_code == 401:
+            logging.warning("  TMDb: invalid API key (401)")
+            return []
+
+        resp.raise_for_status()
+        data = resp.json()
+
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"  TMDb watch/providers request failed: {e}")
+        return []
+    except json.JSONDecodeError:
+        logging.warning("  TMDb returned non-JSON response")
+        return []
+
+    # Extract country-specific results
+    country_data = data.get("results", {}).get(country.upper(), {})
+    if not country_data:
+        logging.debug(f"  TMDb: no watch/providers data for country={country}")
+        return []
+
+    providers = []
+    seen = set()
+    for provider_type in TMDB_WATCH_PROVIDER_TYPES:
+        for entry in country_data.get(provider_type, []):
+            name = entry.get("provider_name", "")
+            if not name:
+                continue
+            # Deduplicate: same provider can appear in multiple types
+            key = (name, provider_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            providers.append({
+                "provider": name,
+                "type": TMDB_WATCH_PROVIDER_TYPE_LABELS.get(provider_type, provider_type),
+            })
+
+    return providers
+
+
 def enrich_entry(
     entry: dict,
     session: "requests.Session",
@@ -1138,6 +1265,9 @@ def enrich_entry(
     covers_rel_path: str,
     sleep_time: float,
     dry_run: bool = False,
+    streaming: bool = False,
+    tmdb_key: Optional[str] = None,
+    country: str = "US",
 ) -> dict:
     """
     Enrich a single entry with Wikidata metadata.
@@ -1149,7 +1279,8 @@ def enrich_entry(
         4. Score and merge candidates
         5. Apply confidence gate
         6. If accepted: extract year, download cover, extract genres
-        7. Attach enrichment data to the entry
+        7. If --streaming: extract platform links, query TMDb for watch providers
+        8. Attach enrichment data to the entry
 
     RETURNS:
         The entry dict, updated with enrichment fields:
@@ -1161,6 +1292,9 @@ def enrich_entry(
             "cover_source": str|None,
             "cover_confidence": str|None,
             "enriched_genres": list[str],
+            "streaming_providers": list[dict],
+            "open_library_url": str|None,
+            "steam_url": str|None,
             "skip_reason": str|None,
         }
     """
@@ -1179,6 +1313,9 @@ def enrich_entry(
         "enriched_genres": [],
         "description": None,
         "source_url": None,
+        "streaming_providers": [],
+        "open_library_url": None,
+        "steam_url": None,
         "skip_reason": None,
     })
 
@@ -1264,6 +1401,40 @@ def enrich_entry(
     # Source URL: English Wikipedia link (if available)
     if winner.get("source_url"):
         entry["source_url"] = winner["source_url"]
+
+    # --- Step 7: Streaming / platform availability ---
+    if streaming:
+        # Books: Open Library link (from Wikidata, no API key needed)
+        if media_type == "book" and winner.get("open_library_id"):
+            ol_id = winner["open_library_id"]
+            entry["open_library_url"] = f"https://openlibrary.org/works/{ol_id}"
+            logging.info(f"  Open Library: {entry['open_library_url']}")
+
+        # Games: Steam link (from Wikidata, no API key needed)
+        if media_type == "game" and winner.get("steam_id"):
+            steam_id = winner["steam_id"]
+            entry["steam_url"] = f"https://store.steampowered.com/app/{steam_id}"
+            logging.info(f"  Steam: {entry['steam_url']}")
+
+        # Movies/Shows: TMDb watch/providers (requires API key)
+        if media_type in ("movie", "show") and tmdb_key:
+            tmdb_id = winner.get("tmdb_movie_id") if media_type == "movie" else winner.get("tmdb_tv_id")
+            if tmdb_id:
+                time.sleep(sleep_time)  # throttle TMDb requests too
+                providers = lookup_tmdb_streaming(
+                    tmdb_id, media_type, tmdb_key, country, session
+                )
+                if providers:
+                    entry["streaming_providers"] = providers
+                    provider_names = [p["provider"] for p in providers[:3]]
+                    logging.info(
+                        f"  Streaming ({country}): {', '.join(provider_names)}"
+                        f"{'...' if len(providers) > 3 else ''}"
+                    )
+                else:
+                    logging.info(f"  No streaming data for {country}")
+            else:
+                logging.debug(f"  No TMDb ID found on Wikidata for '{title}'")
 
     logging.info(
         f"  ENRICHED: '{title}' → QID={winner['qid']}, "
@@ -1373,6 +1544,22 @@ def generate_note_content(entry: dict, covers_rel_path: str) -> str:
     # Wikidata QID: useful for manual verification
     if entry.get("wikidata_qid"):
         lines.append(f"wikidata: {entry['wikidata_qid']}")
+
+    # Streaming availability (movies/shows via TMDb)
+    if entry.get("streaming_providers"):
+        lines.append("streaming:")
+        for sp in entry["streaming_providers"]:
+            provider = sp["provider"].replace('"', '\\"')
+            lines.append(f'  - provider: "{provider}"')
+            lines.append(f"    type: {sp['type']}")
+
+    # Open Library URL (books)
+    if entry.get("open_library_url"):
+        lines.append(f'open_library_url: "{entry["open_library_url"]}"')
+
+    # Steam URL (games)
+    if entry.get("steam_url"):
+        lines.append(f'steam_url: "{entry["steam_url"]}"')
 
     lines.append("---")
     lines.append("")
@@ -1601,6 +1788,32 @@ EXAMPLES:
         default=False,
         help="Enable debug-level logging",
     )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable streaming/platform availability lookups. "
+            "Movies/shows use TMDb (requires --tmdb-key). "
+            "Books get Open Library links, games get Steam links (no key needed)."
+        ),
+    )
+    parser.add_argument(
+        "--tmdb-key",
+        default=None,
+        help=(
+            "TMDb API key (v3) for streaming availability lookups. "
+            "Also reads from TMDB_API_KEY environment variable."
+        ),
+    )
+    parser.add_argument(
+        "--country",
+        default="US",
+        help=(
+            "ISO 3166-1 alpha-2 country code for streaming availability "
+            "(default: US). Examples: US, GB, DE, JP"
+        ),
+    )
 
     return parser
 
@@ -1700,6 +1913,24 @@ def main():
     logging.info(f"Overwrite:  {args.overwrite}")
     logging.info(f"Dry run:    {args.dry_run}")
     logging.info(f"Enrich:     {not args.no_enrich}")
+
+    # Resolve streaming settings
+    streaming_enabled = args.streaming
+    tmdb_key = args.tmdb_key or os.environ.get("TMDB_API_KEY")
+    country = args.country.upper()
+
+    if streaming_enabled:
+        logging.info(f"Streaming:  enabled (country={country})")
+        if tmdb_key:
+            logging.info("TMDb key:   provided")
+        else:
+            logging.info(
+                "TMDb key:   NOT provided — movie/show streaming will be skipped. "
+                "Book/game platform links will still be fetched from Wikidata."
+            )
+    else:
+        logging.info("Streaming:  disabled (use --streaming to enable)")
+
     if only_type:
         logging.info(f"Filter:     {only_type} only")
 
@@ -1769,6 +2000,8 @@ def main():
                 enrich_entry(
                     entry, session, covers_dir, covers_rel,
                     sleep_time=args.sleep, dry_run=args.dry_run,
+                    streaming=streaming_enabled, tmdb_key=tmdb_key,
+                    country=country,
                 )
                 # Throttle between items
                 if i < len(entries):
@@ -1786,6 +2019,9 @@ def main():
                     "enriched_genres": [],
                     "description": None,
                     "source_url": None,
+                    "streaming_providers": [],
+                    "open_library_url": None,
+                    "steam_url": None,
                     "skip_reason": "enrichment disabled",
                 })
 
@@ -1851,6 +2087,8 @@ def main():
     covers_count = sum(1 for e in entries if e.get("cover_filename"))
     skipped_ambiguous = sum(1 for e in entries if e.get("skip_reason") and "ambiguous" in e.get("skip_reason", ""))
     skipped_nocand = sum(1 for e in entries if e.get("skip_reason") and "no candidates" in e.get("skip_reason", ""))
+    streaming_count = sum(1 for e in entries if e.get("streaming_providers"))
+    platform_count = sum(1 for e in entries if e.get("open_library_url") or e.get("steam_url"))
 
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -1864,23 +2102,36 @@ def main():
         print(f"Covers downloaded:        {covers_count}")
         print(f"Skipped (ambiguous):      {skipped_ambiguous}")
         print(f"Skipped (no candidates):  {skipped_nocand}")
+    if streaming_enabled:
+        print(f"Streaming data found:     {streaming_count}")
+        print(f"Platform links found:     {platform_count}")
     print("=" * 60)
 
     # Per-type breakdown
     type_counts = {}
     for e in entries:
         t = e["type"]
-        type_counts.setdefault(t, {"total": 0, "enriched": 0, "covers": 0})
+        type_counts.setdefault(t, {"total": 0, "enriched": 0, "covers": 0, "streaming": 0, "platforms": 0})
         type_counts[t]["total"] += 1
         if e.get("enriched"):
             type_counts[t]["enriched"] += 1
         if e.get("cover_filename"):
             type_counts[t]["covers"] += 1
+        if e.get("streaming_providers"):
+            type_counts[t]["streaming"] += 1
+        if e.get("open_library_url") or e.get("steam_url"):
+            type_counts[t]["platforms"] += 1
 
     if type_counts:
         print("\nPer-type breakdown:")
         for t, counts in sorted(type_counts.items()):
-            print(f"  {t:8s}: {counts['total']} total, {counts['enriched']} enriched, {counts['covers']} covers")
+            line = f"  {t:8s}: {counts['total']} total, {counts['enriched']} enriched, {counts['covers']} covers"
+            if streaming_enabled:
+                if t in ("movie", "show"):
+                    line += f", {counts['streaming']} streaming"
+                elif t in ("book", "game"):
+                    line += f", {counts['platforms']} platform links"
+            print(line)
 
     if zip_path:
         print(f"\nOutput zip: {zip_path}")

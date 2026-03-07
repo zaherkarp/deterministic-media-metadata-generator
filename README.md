@@ -121,6 +121,9 @@ uv run python enrich_media.py \
 | `--no-enrich` | No | `false` | Skip Wikidata lookup entirely |
 | `--zip` | No | `false` | Package output as zip |
 | `--verbose` | No | `false` | Debug-level logging |
+| `--streaming` | No | `false` | Enable streaming/platform availability lookups |
+| `--tmdb-key` | No | — | TMDb API key (v3) for movie/show streaming. Also reads `TMDB_API_KEY` env var |
+| `--country` | No | `US` | ISO 3166-1 country code for streaming availability (e.g., `US`, `GB`, `DE`) |
 
 ## Input Format
 
@@ -185,6 +188,9 @@ wikidata: Q1234567
 | `description` | Wikidata has an English description | Wikidata `schema:description` |
 | `source_url` | Wikipedia article or Wikidata page exists | English Wikipedia or Wikidata fallback |
 | `wikidata` | Enrichment matched a Wikidata item | Wikidata QID |
+| `streaming` | TMDb has watch/provider data for this country | TMDb (JustWatch) |
+| `open_library_url` | Wikidata has Open Library Work ID (P5331) | Wikidata |
+| `steam_url` | Wikidata has Steam App ID (P1733) | Wikidata |
 
 ## Title Normalization Rules
 
@@ -242,6 +248,70 @@ Covers are downloaded from Wikimedia Commons (via Wikidata's P18 property):
 **No external hotlinks.** Images are real files in your vault.
 
 **No fake URLs.** If download fails, the cover field is omitted entirely.
+
+## Streaming & Platform Availability
+
+When `--streaming` is passed, the script adds "where to watch/play/read" data to notes. This is opt-in to preserve the no-API-key-by-default philosophy.
+
+### Movies & Shows — TMDb Watch Providers
+
+Uses TMDb's watch/providers API (powered by JustWatch data) to show streaming, rent, and buy options per country.
+
+**Requirements:**
+- A free TMDb API key (v3). Register at [themoviedb.org](https://www.themoviedb.org/settings/api).
+- Pass via `--tmdb-key YOUR_KEY` or set the `TMDB_API_KEY` environment variable.
+
+**How it works:**
+1. During Wikidata enrichment, the script fetches the TMDb ID (P4983 for movies, P4947 for TV series).
+2. If a TMDb ID is found and an API key is provided, it queries TMDb's `/movie/{id}/watch/providers` or `/tv/{id}/watch/providers` endpoint.
+3. Results are filtered by `--country` (default `US`).
+
+**Output in frontmatter:**
+```yaml
+streaming:
+  - provider: "Netflix"
+    type: subscription
+  - provider: "Apple TV"
+    type: rent
+  - provider: "Amazon Video"
+    type: buy
+```
+
+### Books — Open Library
+
+Fetches the Open Library Work ID (P5331) from Wikidata — no API key needed.
+
+```yaml
+open_library_url: "https://openlibrary.org/works/OL45804W"
+```
+
+### Games — Steam
+
+Fetches the Steam App ID (P1733) from Wikidata — no API key needed.
+
+```yaml
+steam_url: "https://store.steampowered.com/app/105600"
+```
+
+### Example Commands
+
+```bash
+# Enable streaming for movies (US availability):
+uv run python enrich_media.py -i media.md -v ~/vault --only movies --streaming --tmdb-key YOUR_KEY
+
+# Enable streaming with a different country:
+uv run python enrich_media.py -i media.md -v ~/vault --streaming --tmdb-key YOUR_KEY --country GB
+
+# Enable streaming via env var (no key on command line):
+export TMDB_API_KEY=your_key_here
+uv run python enrich_media.py -i media.md -v ~/vault --streaming
+
+# Books/games get platform links without any API key:
+uv run python enrich_media.py -i media.md -v ~/vault --only books --streaming
+uv run python enrich_media.py -i media.md -v ~/vault --only games --streaming
+```
+
+**Note:** If `--streaming` is passed without a TMDb key, movie/show streaming data is skipped (with a log message), but book/game platform links still work since they come from Wikidata.
 
 ## Error Handling
 
