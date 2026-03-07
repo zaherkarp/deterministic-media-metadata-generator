@@ -485,10 +485,23 @@ def extract_and_normalize(entry: dict) -> dict:
     filename = generate_safe_filename(title, year_hint)
 
     # -----------------------------------------------------------------------
+    # STEP 10: Generate search title
+    # This is the title used for Wikidata SPARQL queries.  We strip ALL
+    # remaining parentheticals (e.g., "(LeGuin)", "(The Pixel Hunt)")
+    # because Wikidata labels rarely contain them.  The clean_title is
+    # kept intact for display / note headings.
+    # -----------------------------------------------------------------------
+    search_title = re.sub(r'\s*\([^)]*\)\s*', ' ', title).strip()
+    search_title = re.sub(r'\s+', ' ', search_title)
+    if not search_title:
+        search_title = title  # fallback if stripping removed everything
+
+    # -----------------------------------------------------------------------
     # RETURN: Enriched entry with all extracted metadata
     # -----------------------------------------------------------------------
     entry.update({
         "clean_title": title,
+        "search_title": search_title,
         "dedup_key": dedup_key,
         "year_hint": year_hint,
         "source": source,
@@ -737,11 +750,6 @@ def build_sparql_query(title: str, media_type: str) -> str:
                         mwapi:language "en" .
         ?item wikibase:apiOutputItem mwapi:item .
       }}
-
-      # --- Confirm exact label match (case-insensitive) ---
-      ?item rdfs:label ?label .
-      FILTER(LANG(?label) = "en")
-      FILTER(LCASE(?label) = LCASE("{escaped_title}"))
 
       # --- Filter by media type (instance-of) ---
       VALUES ?type {{ {type_values} }}
@@ -1307,11 +1315,10 @@ def enrich_entry(
     Enrich a single entry with Wikidata metadata.
 
     PIPELINE:
-        1. Build SPARQL query (exact match first)
+        1. Build SPARQL query using EntitySearch (indexed, fast)
         2. Execute query
-        3. If no results, try fuzzy query
-        4. Score and merge candidates
-        5. Apply confidence gate
+        3. Score and merge candidates
+        4. Apply confidence gate
         6. If accepted: extract year, download cover, extract genres
         7. If --streaming: extract platform links, query TMDb for watch providers
         8. Attach enrichment data to the entry
@@ -1333,6 +1340,7 @@ def enrich_entry(
         }
     """
     title = entry["clean_title"]
+    search_title = entry.get("search_title", title)
     media_type = entry["type"]
     year_hint = entry.get("year_hint")
 
@@ -1353,23 +1361,19 @@ def enrich_entry(
         "skip_reason": None,
     })
 
-    # --- Step 1-2: Exact match query ---
-    sparql = build_sparql_query(title, media_type)
+    # --- Step 1-2: Query Wikidata via EntitySearch ---
+    # Use search_title (parentheticals stripped) for SPARQL, but score
+    # candidates against the search_title for confidence.
+    # EntitySearch returns ranked results; scoring + confidence gate
+    # handle exact vs near-match disambiguation.
+    sparql = build_sparql_query(search_title, media_type)
     if not sparql:
         entry["skip_reason"] = "no SPARQL query (unknown type)"
         return entry
 
-    logging.info(f"  Querying Wikidata (exact): '{title}' [{media_type}]")
+    logging.info(f"  Querying Wikidata: '{search_title}' [{media_type}]")
     bindings = query_wikidata(sparql, session)
-    candidates = merge_candidates(bindings, title, year_hint, is_fuzzy=False)
-
-    # --- Step 3: Fuzzy fallback if no exact results ---
-    if not candidates:
-        logging.info(f"  No exact match. Trying fuzzy query...")
-        time.sleep(sleep_time)  # throttle between requests
-        sparql_fuzzy = build_sparql_query_fuzzy(title, media_type)
-        bindings_fuzzy = query_wikidata(sparql_fuzzy, session)
-        candidates = merge_candidates(bindings_fuzzy, title, year_hint, is_fuzzy=True)
+    candidates = merge_candidates(bindings, search_title, year_hint, is_fuzzy=False)
 
     # --- Step 4-5: Confidence gate ---
     winner = confidence_gate(candidates)
