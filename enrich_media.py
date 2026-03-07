@@ -164,6 +164,15 @@ TRAILING_JUNK_PATTERNS = [
     r"\s*\?\s*$",
 ]
 
+# --- Search Title Cleanup Patterns ---
+# These apply ONLY to the search_title (used for Wikidata queries),
+# not the clean_title (used for display). More aggressive stripping
+# is safe here because it won't affect the note heading or filename.
+SEARCH_TITLE_JUNK_PATTERNS = [
+    r"'s\s+series\s*$",     # "Fran Leiboweitz's series" → "Fran Leiboweitz"
+    r"\s+series\s*$",       # trailing bare "series" (user annotation, not title)
+]
+
 # --- Characters Illegal in Filenames ---
 # These characters are stripped from filenames to ensure cross-OS compatibility.
 # macOS is generally lenient, but Windows compat and Obsidian expectations matter.
@@ -409,7 +418,7 @@ def extract_and_normalize(entry: dict) -> dict:
                 original_parens.append(year_extra_match.group(0))
                 title = title[:year_extra_match.start()].strip()
 
-    # Pattern (d): (YYYY film) or (YYYY show) etc.
+    # Pattern (d): (YYYY film) or (YYYY show) etc. — at end
     if year_hint is None:
         year_desc_match = re.search(
             r'\((\d{4})\s+(film|movie|show|series|game|novel|book|anime|documentary)\)\s*$',
@@ -421,6 +430,22 @@ def extract_and_normalize(entry: dict) -> dict:
                 year_hint = candidate_year
                 original_parens.append(year_desc_match.group(0))
                 title = title[:year_desc_match.start()].strip()
+
+    # Pattern (e): (YYYY) mid-title followed by user annotation
+    # e.g., "Living (2022) - Ikiru remake" → year=2022, title="Living"
+    # Only extract if followed by a separator (-, –, —) and more text.
+    if year_hint is None:
+        mid_year_match = re.search(r'\((\d{4})\)\s*[-–—]\s*', title)
+        if mid_year_match:
+            candidate_year = int(mid_year_match.group(1))
+            if YEAR_RANGE[0] <= candidate_year <= YEAR_RANGE[1]:
+                title_before = title[:mid_year_match.start()].strip()
+                if title_before:
+                    year_hint = candidate_year
+                    original_parens.append(f"({candidate_year})")
+                    # Keep the title before the year; the annotation after
+                    # will be handled by separator normalization + annotation stripping
+                    title = title_before
 
     # Pattern (c): Title, YYYY at end — e.g., "Little Murders, 1971"
     if year_hint is None:
@@ -519,6 +544,10 @@ def extract_and_normalize(entry: dict) -> dict:
     if not search_title:
         search_title = title  # fallback if stripping removed everything
 
+    # Strip search-specific junk patterns (more aggressive than clean_title)
+    for pattern in SEARCH_TITLE_JUNK_PATTERNS:
+        search_title = re.sub(pattern, '', search_title, flags=re.IGNORECASE).strip()
+
     # Also strip colon-suffixed user annotations from search_title.
     # Real subtitles typically have Title Case ("Frieren: Beyond Journey's End")
     # while user annotations are all lowercase ("Inherit the Wind: old drama").
@@ -529,6 +558,17 @@ def extract_and_normalize(entry: dict) -> dict:
         after_stripped = after_colon.strip()
         if before_colon.strip() and after_stripped and after_stripped[0].islower():
             search_title = before_colon.strip()
+
+    # -----------------------------------------------------------------------
+    # STEP 10b: Strip trailing author/creator names from book search titles
+    # Books often have "Title AuthorLastName" or "Title FirstName LastName"
+    # appended without any separator. We detect this pattern: if the last
+    # 1-3 words are all Capitalized single words not matching common title
+    # words, they're likely author names. Only for books, since movies/shows
+    # rarely have this pattern.
+    # -----------------------------------------------------------------------
+    if media_type == "book":
+        search_title = _strip_trailing_author_names(search_title)
 
     # -----------------------------------------------------------------------
     # RETURN: Enriched entry with all extracted metadata
@@ -543,6 +583,68 @@ def extract_and_normalize(entry: dict) -> dict:
         "original_parens": original_parens,
     })
     return entry
+
+
+def _strip_trailing_author_names(search_title: str) -> str:
+    """
+    Strip trailing author/creator names from book search titles.
+
+    Detects patterns like:
+      "The Official Stardew Valley Cookbook ConcernedApe Ryan Novak"
+        → "The Official Stardew Valley Cookbook"
+      "Cyberpunk 2077 Library Edition Volume 1 Sztybor"
+        → "Cyberpunk 2077 Library Edition Volume 1"
+
+    HEURISTIC: Walk backwards through words. If the trailing words are
+    capitalized single words (not common title words like "the", "of", etc.)
+    and there's a clear title portion before them, strip them.
+
+    We only strip if at least 2 words remain as the title.
+    """
+    # Common title words that should NOT be treated as author names
+    TITLE_WORDS = {
+        "the", "a", "an", "of", "in", "on", "at", "to", "for", "and",
+        "or", "is", "was", "are", "by", "with", "from", "into", "its",
+        "not", "no", "my", "your", "his", "her", "our", "their",
+        "this", "that", "it", "i", "we", "you", "he", "she", "they",
+        "all", "one", "two", "three", "new", "old", "last", "first",
+        "beyond", "under", "over", "between", "after", "before",
+        "never", "let", "go", "how", "why", "what", "when", "where",
+        "day", "days", "night", "time", "world", "life", "city",
+        "mind", "wind", "blood", "dragon", "street", "corner",
+        "volume", "edition", "library", "series",
+    }
+
+    words = search_title.split()
+    if len(words) < 3:
+        return search_title  # too short to have author + title
+
+    # Walk backwards: count trailing words that look like proper names
+    # (capitalized, single word, not a common title word).
+    # Stop at 3 to avoid eating into the actual title.
+    author_count = 0
+    for word in reversed(words):
+        if author_count >= 3:
+            break
+        clean = re.sub(r'[^a-zA-Z]', '', word)
+        if not clean:
+            break
+        if clean[0].isupper() and clean.lower() not in TITLE_WORDS and len(clean) >= 2:
+            author_count += 1
+        else:
+            break
+
+    # Only strip if we found 2-3 trailing author-like words (a single
+    # trailing capitalized word is too often just the last word of the title)
+    # AND at least 2 words remain as the title
+    if 2 <= author_count <= 3 and len(words) - author_count >= 2:
+        stripped = " ".join(words[:-author_count])
+        logging.debug(
+            f"  Stripped trailing author names: '{search_title}' → '{stripped}'"
+        )
+        return stripped
+
+    return search_title
 
 
 def generate_safe_filename(title: str, year: Optional[int] = None) -> str:
@@ -1334,6 +1436,48 @@ def lookup_tmdb_streaming(
     return providers
 
 
+def _generate_fallback_titles(search_title: str) -> list[str]:
+    """
+    Generate simplified title variants for fallback searches.
+
+    When the primary EntitySearch fails to find candidates, we try
+    progressively simpler forms of the title:
+      1. Main title only (before colon/subtitle separator)
+      2. Title with common separators restored (e.g., "/" for game/anime franchises)
+      3. First N significant words (for very long titles)
+
+    Returns a list of alternative search strings (may be empty if no
+    meaningful simplification is possible).
+    """
+    variants = []
+
+    # Variant 1: strip subtitle (part after colon)
+    if ':' in search_title:
+        main_part = search_title.split(':')[0].strip()
+        if len(main_part) >= 3:
+            variants.append(main_part)
+
+    # Variant 2: try inserting "/" between words for franchise titles
+    # Common pattern: "Fate Grand Order" → "Fate/Grand Order"
+    words = search_title.split()
+    if 2 <= len(words) <= 5:
+        # Try slash between first and second word
+        slash_variant = words[0] + "/" + " ".join(words[1:])
+        if slash_variant != search_title:
+            variants.append(slash_variant)
+
+    # Variant 3: for long titles (5+ words), try just the first 3-4 words
+    if len(words) >= 5:
+        short = " ".join(words[:4])
+        if short not in variants:
+            variants.append(short)
+        shorter = " ".join(words[:3])
+        if shorter not in variants:
+            variants.append(shorter)
+
+    return variants
+
+
 def enrich_entry(
     entry: dict,
     session: "requests.Session",
@@ -1411,6 +1555,28 @@ def enrich_entry(
 
     # --- Step 4-5: Confidence gate ---
     winner = confidence_gate(candidates)
+
+    # --- Step 4b: Fuzzy fallback with simplified title ---
+    # If no winner from exact search, try progressively simpler variants:
+    #   1. Main title only (before colon/subtitle)
+    #   2. The fuzzy query (same text, lower threshold via is_fuzzy scoring)
+    if winner is None:
+        fallback_titles = _generate_fallback_titles(search_title)
+        for fb_title in fallback_titles:
+            if fb_title == search_title:
+                continue  # already tried this one
+            logging.info(f"  Fallback search: '{fb_title}' [{media_type}]")
+            fb_sparql = build_sparql_query(fb_title, media_type)
+            if not fb_sparql:
+                continue
+            time.sleep(sleep_time)
+            fb_bindings = query_wikidata(fb_sparql, session)
+            fb_candidates = merge_candidates(fb_bindings, fb_title, year_hint, is_fuzzy=True)
+            winner = confidence_gate(fb_candidates)
+            if winner:
+                logging.info(f"  Fallback matched: '{winner['label']}' ({winner['qid']})")
+                break
+
     if winner is None:
         reason = "no candidates" if not candidates else "ambiguous/low confidence"
         entry["skip_reason"] = reason
