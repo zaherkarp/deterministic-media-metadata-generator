@@ -816,6 +816,7 @@ def build_sparql_query(title: str, media_type: str) -> str:
     # so OPTIONAL blocks don't create a cartesian explosion.
     query = f"""
     SELECT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article
+           ?altLabel ?startDate
            ?tmdbMovieId ?tmdbTvId ?openLibraryId ?steamId WHERE {{
       # --- Fast indexed lookup via MediaWiki search ---
       SERVICE wikibase:mwapi {{
@@ -833,11 +834,18 @@ def build_sparql_query(title: str, media_type: str) -> str:
       # --- Optional: publication/release date (P577) ---
       OPTIONAL {{ ?item wdt:P577 ?date . }}
 
+      # --- Optional: start date (P580) — used for TV series premiere dates ---
+      OPTIONAL {{ ?item wdt:P580 ?startDate . }}
+
       # --- Optional: image (P18) ---
       OPTIONAL {{ ?item wdt:P18 ?image . }}
 
       # --- Optional: genre (P136) — use label service, not manual join ---
       OPTIONAL {{ ?item wdt:P136 ?genre . }}
+
+      # --- Optional: alternative labels (skos:altLabel) ---
+      OPTIONAL {{ ?item skos:altLabel ?altLabel .
+                 FILTER(LANG(?altLabel) = "en") }}
 
       # --- Optional: description (schema:description) ---
       OPTIONAL {{ ?item schema:description ?description .
@@ -882,6 +890,7 @@ def build_sparql_query_fuzzy(title: str, media_type: str) -> str:
 
     query = f"""
     SELECT ?item ?itemLabel ?date ?image ?genreLabel ?description ?article
+           ?altLabel ?startDate
            ?tmdbMovieId ?tmdbTvId ?openLibraryId ?steamId WHERE {{
       # --- Fast indexed lookup (fuzzy — no exact-match filter) ---
       SERVICE wikibase:mwapi {{
@@ -897,8 +906,13 @@ def build_sparql_query_fuzzy(title: str, media_type: str) -> str:
       ?item wdt:P31 ?type .
 
       OPTIONAL {{ ?item wdt:P577 ?date . }}
+      OPTIONAL {{ ?item wdt:P580 ?startDate . }}
       OPTIONAL {{ ?item wdt:P18 ?image . }}
       OPTIONAL {{ ?item wdt:P136 ?genre . }}
+
+      # --- Optional: alternative labels ---
+      OPTIONAL {{ ?item skos:altLabel ?altLabel .
+                 FILTER(LANG(?altLabel) = "en") }}
 
       # --- Optional: description ---
       OPTIONAL {{ ?item schema:description ?description .
@@ -1027,6 +1041,13 @@ def score_candidate(
     # --- Extract label ---
     result["label"] = candidate.get("itemLabel", {}).get("value", "")
 
+    # --- Extract: alternative labels ---
+    alt_label = candidate.get("altLabel", {}).get("value", "")
+    if alt_label:
+        result["alt_labels"] = [alt_label]
+    else:
+        result["alt_labels"] = []
+
     # --- Score: label match ---
     if result["label"].lower() == title.lower():
         result["score"] += CONFIDENCE["EXACT_LABEL_BONUS"]
@@ -1038,6 +1059,14 @@ def score_candidate(
         if norm_label == norm_title:
             result["score"] += CONFIDENCE["CLOSE_LABEL_BONUS"]
             result["score_breakdown"]["close_label"] = CONFIDENCE["CLOSE_LABEL_BONUS"]
+        elif alt_label:
+            # Check if any alternative label matches
+            if alt_label.lower() == title.lower():
+                result["score"] += CONFIDENCE["CLOSE_LABEL_BONUS"]
+                result["score_breakdown"]["alt_label_match"] = CONFIDENCE["CLOSE_LABEL_BONUS"]
+            elif _normalize_for_comparison(alt_label) == norm_title:
+                result["score"] += CONFIDENCE["CLOSE_LABEL_BONUS"]
+                result["score_breakdown"]["alt_label_match"] = CONFIDENCE["CLOSE_LABEL_BONUS"]
 
     # --- Extract and score: year ---
     date_str = candidate.get("date", {}).get("value", "")
@@ -1045,6 +1074,14 @@ def score_candidate(
         try:
             # Wikidata dates are ISO format: "1985-01-01T00:00:00Z"
             result["year"] = int(date_str[:4])
+        except (ValueError, IndexError):
+            pass
+
+    # --- Extract: start date (P580) as fallback for shows ---
+    start_date_str = candidate.get("startDate", {}).get("value", "")
+    if start_date_str and not result["year"]:
+        try:
+            result["year"] = int(start_date_str[:4])
         except (ValueError, IndexError):
             pass
 
@@ -1142,6 +1179,10 @@ def merge_candidates(raw_bindings: list[dict], title: str, year_hint: Optional[i
             for g in scored["genres"]:
                 if g not in existing["genres"]:
                     existing["genres"].append(g)
+            # Merge alt_labels
+            for al in scored.get("alt_labels", []):
+                if al not in existing.get("alt_labels", []):
+                    existing.setdefault("alt_labels", []).append(al)
             # Take the higher score (shouldn't differ much, but safety)
             if scored["score"] > existing["score"]:
                 existing["score"] = scored["score"]
@@ -1159,6 +1200,27 @@ def merge_candidates(raw_bindings: list[dict], title: str, year_hint: Optional[i
             for pid_key in ("tmdb_movie_id", "tmdb_tv_id", "open_library_id", "steam_id"):
                 if not existing.get(pid_key) and scored.get(pid_key):
                     existing[pid_key] = scored[pid_key]
+
+    # Post-merge: re-check alt_labels for candidates that didn't get a label match.
+    # A candidate may have gotten no label bonus from its primary label, but after
+    # merging all alt_labels, one of them might match the search title.
+    norm_title = _normalize_for_comparison(title)
+    for cand in by_qid.values():
+        has_label_bonus = any(
+            k in cand["score_breakdown"]
+            for k in ("exact_label", "close_label", "alt_label_match")
+        )
+        if has_label_bonus:
+            continue
+        for al in cand.get("alt_labels", []):
+            if al.lower() == title.lower():
+                cand["score"] += CONFIDENCE["CLOSE_LABEL_BONUS"]
+                cand["score_breakdown"]["alt_label_match"] = CONFIDENCE["CLOSE_LABEL_BONUS"]
+                break
+            elif _normalize_for_comparison(al) == norm_title:
+                cand["score"] += CONFIDENCE["CLOSE_LABEL_BONUS"]
+                cand["score_breakdown"]["alt_label_match"] = CONFIDENCE["CLOSE_LABEL_BONUS"]
+                break
 
     candidates = list(by_qid.values())
     candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -1544,21 +1606,33 @@ def _generate_fallback_titles(search_title: str) -> list[str]:
 
     When the primary EntitySearch fails to find candidates, we try
     progressively simpler forms of the title:
-      1. Main title only (before colon/subtitle separator)
-      2. First N significant words (for very long titles)
+      1. Without leading "The " (Wikidata labels sometimes omit articles)
+      2. Main title only (before colon/subtitle separator)
+      3. First N significant words (for very long titles with author/publisher junk)
+      4. Known proper title (for titles with embedded author names like "Arendt: ...")
 
     Returns a list of alternative search strings (may be empty if no
     meaningful simplification is possible).
     """
     variants = []
 
-    # Variant 1: strip subtitle (part after colon)
+    # Variant 1: strip leading "The " — Wikidata labels sometimes omit articles
+    if search_title.lower().startswith("the ") and len(search_title) > 6:
+        without_the = search_title[4:].strip()
+        if without_the not in variants:
+            variants.append(without_the)
+
+    # Variant 2: strip subtitle (part after colon)
     if ':' in search_title:
         main_part = search_title.split(':')[0].strip()
-        if len(main_part) >= 3:
+        if len(main_part) >= 3 and main_part not in variants:
             variants.append(main_part)
+        # Also try the subtitle alone — handles "Author: Real Title" patterns
+        after_colon = search_title.split(':', 1)[1].strip()
+        if len(after_colon) >= 3 and after_colon not in variants:
+            variants.append(after_colon)
 
-    # Variant 2: for long titles (5+ words), try shorter prefixes
+    # Variant 3: for long titles (5+ words), try shorter prefixes
     # This helps with titles polluted by author names or annotations
     # e.g., "The Official Stardew Valley Cookbook ConcernedApe Ryan Novak"
     words = search_title.split()
@@ -2306,6 +2380,12 @@ def main():
             )
     else:
         logging.info("Streaming:  disabled (use --streaming to enable)")
+
+    if not args.no_enrich and not tmdb_key:
+        logging.info(
+            "TMDb key:   NOT provided — cover art limited to Wikidata Commons. "
+            "Pass --tmdb-key or set TMDB_API_KEY for many more poster downloads."
+        )
 
     if only_type:
         logging.info(f"Filter:     {only_type} only")
