@@ -259,6 +259,20 @@ def parse_input_file(filepath: str, only_type: Optional[str] = None) -> list[dic
         The Mandalorian (from Anton).md
         ...
 
+    Optionally, sections may contain sub-headings (### level) that indicate
+    a topic or category. Entries under a sub-heading inherit that topic:
+
+        ## BOOKS
+        ### Software Engineering
+        - [Clean Code _(Robert C. Martin)_](http://example.com)
+        - [Test Driven Development _(Kent Beck)_](http://example.com)
+        ### Ruby
+        - [Practical OOD in Ruby _(Sandy Metz)_](http://example.com)
+
+    Entries may also use markdown link syntax:
+        - [Title _(Author)_](URL)
+    In which case the URL is extracted and stored on the entry.
+
     Each entry is one line under a section header. Section headers are
     identified by '##' prefix and matched against SECTION_TYPE_MAP.
 
@@ -268,6 +282,8 @@ def parse_input_file(filepath: str, only_type: Optional[str] = None) -> list[dic
             "raw_line": str,         # original line from file
             "type": str,             # "book", "movie", "show", "game"
             "raw_title": str,        # line with .md stripped but otherwise raw
+            "topic": str|None,       # sub-heading topic if present
+            "url": str|None,         # URL if entry used markdown link syntax
         }
 
     PARAMETERS:
@@ -276,6 +292,7 @@ def parse_input_file(filepath: str, only_type: Optional[str] = None) -> list[dic
     """
     entries = []
     current_type = None
+    current_topic = None
 
     with open(filepath, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, start=1):
@@ -288,20 +305,26 @@ def parse_input_file(filepath: str, only_type: Optional[str] = None) -> list[dic
             # --- Detect Section Headers ---
             # Match lines like "## BOOKS", "## MOVIES", "# TV Shows", etc.
             # We're flexible: 1-6 '#' characters, optional space, then the name.
-            header_match = re.match(r'^#{1,6}\s+(.+)$', stripped)
+            header_match = re.match(r'^(#{1,6})\s+(.+)$', stripped)
             if header_match:
-                header_text = header_match.group(1).strip().lower()
-                # Remove any trailing punctuation or decoration from header
-                header_text = re.sub(r'[:\-–—]+$', '', header_text).strip()
+                header_hashes = header_match.group(1)
+                header_text = header_match.group(2).strip()
+                header_text_lower = re.sub(r'[:\-–—]+$', '', header_text).strip().lower()
 
-                if header_text in SECTION_TYPE_MAP:
-                    current_type = SECTION_TYPE_MAP[header_text]
-                    logging.debug(f"Line {line_num}: Detected section '{header_text}' → type='{current_type}'")
+                if header_text_lower in SECTION_TYPE_MAP:
+                    current_type = SECTION_TYPE_MAP[header_text_lower]
+                    current_topic = None  # Reset topic when entering a new section
+                    logging.debug(f"Line {line_num}: Detected section '{header_text_lower}' → type='{current_type}'")
+                elif current_type is not None and len(header_hashes) >= 3:
+                    # Sub-heading within a known section — treat as topic
+                    current_topic = header_text.strip()
+                    logging.debug(f"Line {line_num}: Detected topic '{current_topic}' under type='{current_type}'")
                 else:
                     # Unknown section header — might be a different part of the note.
                     # We stop collecting until we hit a known section.
-                    logging.debug(f"Line {line_num}: Unknown section '{header_text}', pausing collection")
+                    logging.debug(f"Line {line_num}: Unknown section '{header_text_lower}', pausing collection")
                     current_type = None
+                    current_topic = None
                 continue
 
             # --- Skip lines if we haven't entered a known section yet ---
@@ -317,6 +340,17 @@ def parse_input_file(filepath: str, only_type: Optional[str] = None) -> list[dic
             entry_text = re.sub(r'^[-*]\s+', '', stripped)
             entry_text = re.sub(r'^\d+\.\s+', '', entry_text)
 
+            # --- Extract URL from markdown link syntax [Title](URL) ---
+            entry_url = None
+            link_match = re.match(r'^\[([^\]]+)\]\(([^)]+)\)$', entry_text)
+            if link_match:
+                entry_text = link_match.group(1)
+                entry_url = link_match.group(2)
+                # Strip wrapping double-underscores from URLs (e.g., __http://...__)
+                entry_url = re.sub(r'^__(.+)__$', r'\1', entry_url)
+                # Strip markdown italic markers (e.g., _Author Name_)
+                entry_text = re.sub(r'_([^_]+)_', r'\1', entry_text)
+
             # Strip wikilinks if the input uses [[...]] notation
             entry_text = re.sub(r'\[\[([^\]]+)\]\]', r'\1', entry_text)
 
@@ -325,6 +359,8 @@ def parse_input_file(filepath: str, only_type: Optional[str] = None) -> list[dic
                 "type": current_type,
                 "raw_title": entry_text,
                 "line_num": line_num,
+                "topic": current_topic,
+                "url": entry_url,
             })
 
     logging.info(f"Parsed {len(entries)} entries from '{filepath}'")
@@ -1966,6 +2002,11 @@ def generate_note_content(entry: dict, covers_rel_path: str) -> str:
 
     # --- Optional YAML fields (only if data present) ---
 
+    # Topic: sub-heading category, e.g., "Software Engineering"
+    if entry.get("topic"):
+        topic = entry["topic"].replace('"', '\\"')
+        lines.append(f'topic: "{topic}"')
+
     # Source: e.g., "from Anton"
     if entry.get("source"):
         lines.append(f"source: {entry['source']}")
@@ -2019,6 +2060,10 @@ def generate_note_content(entry: dict, covers_rel_path: str) -> str:
     # Steam URL (games)
     if entry.get("steam_url"):
         lines.append(f'steam_url: "{entry["steam_url"]}"')
+
+    # External URL from markdown link syntax in input
+    if entry.get("url"):
+        lines.append(f'url: "{entry["url"]}"')
 
     lines.append("---")
     lines.append("")
