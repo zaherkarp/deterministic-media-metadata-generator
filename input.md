@@ -34,7 +34,7 @@ Metallic Rouge.md
 Fate Grand Order.md
 Hinamatsuri.md
 The Pitt.md
-Severence, lol.md
+Severance, lol.md
 Assassination Classroom.md
 Murderbot.md
 Basilisk (2005).md
