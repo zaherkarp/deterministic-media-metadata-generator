@@ -23,13 +23,34 @@ STREAMING AVAILABILITY:
     - Books: Fetches Open Library Work ID (P5331) from Wikidata — no key needed.
     - Games: Fetches Steam App ID (P1733) from Wikidata — no key needed.
 
+FUZZY MATCHING:
+    The script supports multiple tiers of string matching for Wikidata
+    candidate scoring, each adding confidence:
+    - Exact label match (case-insensitive): +3
+    - Normalized label match (strip punctuation/accents): +2
+    - RapidFuzz token_set_ratio >= 85: +1 (pip install rapidfuzz)
+    - DeezyMatch neural model match: +2 (pip install DeezyMatch)
+    - Cross-source validation (TMDb/OpenLibrary/Steam): +1
+
+QA REPORTING:
+    Use --qa-report to generate a quality assurance report that flags:
+    - Low-confidence matches near the acceptance threshold
+    - Fuzzy-only matches (no exact/close label match)
+    - Year mismatches between input hints and Wikidata
+    - Missing covers for enriched entries
+    - Duplicate Wikidata QIDs across entries
+    - DeezyMatch scoring statistics
+
 USAGE:
     python3 enrich_media.py --input media_list.md --vault ~/my-vault
     python3 enrich_media.py --input media_list.md --vault ~/my-vault --only movies
     python3 enrich_media.py --input media_list.md --vault ~/my-vault --dry-run
+    python3 enrich_media.py --input list.md --vault ~/v --cross-validate --qa-report qa.txt
 
 REQUIRES:
-    pip install requests   (only external dependency)
+    pip install requests                 (core dependency)
+    pip install rapidfuzz                (optional: fuzzy string matching)
+    pip install DeezyMatch               (optional: neural fuzzy matching)
 
 AUTHOR: Generated for Z's Obsidian media library workflow
 """
@@ -58,6 +79,32 @@ try:
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
+
+# ---------------------------------------------------------------------------
+# OPTIONAL DEPENDENCY: rapidfuzz (for fuzzy string matching scoring)
+# Adds token-based similarity scoring to candidate evaluation. Lightweight,
+# C++-backed, MIT licensed. Falls back gracefully if not installed.
+# ---------------------------------------------------------------------------
+try:
+    from rapidfuzz import fuzz as rfuzz
+    HAS_RAPIDFUZZ = True
+except ImportError:
+    HAS_RAPIDFUZZ = False
+
+# ---------------------------------------------------------------------------
+# OPTIONAL DEPENDENCY: DeezyMatch (deep learning fuzzy string matching)
+# Used for neural candidate ranking when a pre-trained model is available.
+# Heavy dependency (PyTorch, faiss). Entirely optional — enabled only when
+# --deezymatch-model is passed.
+# ---------------------------------------------------------------------------
+try:
+    from DeezyMatch import candidate_ranker as dm_candidate_ranker
+    from DeezyMatch import inference as dm_inference
+    from DeezyMatch import combine_vecs as dm_combine_vecs
+    from DeezyMatch import train as dm_train
+    HAS_DEEZYMATCH = True
+except ImportError:
+    HAS_DEEZYMATCH = False
 
 
 # ===========================================================================
@@ -193,8 +240,12 @@ CONFIDENCE = {
     "ACCEPT_THRESHOLD": 2,       # minimum score to accept a Wikidata match
     "EXACT_LABEL_BONUS": 3,      # exact label match (case-insensitive)
     "CLOSE_LABEL_BONUS": 2,      # label matches after normalization
+    "FUZZY_MATCH_BONUS": 1,      # rapidfuzz token_set_ratio >= threshold (partial credit)
+    "FUZZY_MATCH_THRESHOLD": 85, # minimum rapidfuzz score (0-100) to earn bonus
+    "DEEZYMATCH_BONUS": 2,       # DeezyMatch neural model says it's a match
     "YEAR_MATCH_BONUS": 2,       # year from Wikidata matches our year hint
     "HAS_IMAGE_BONUS": 1,        # candidate has a P18 image
+    "CROSS_SOURCE_BONUS": 1,     # cross-source validation confirmed the match
     "AMBIGUITY_PENALTY": -2,     # if top two candidates are close in score
     "MIN_MARGIN": 1,             # minimum margin between #1 and #2 to accept
 }
@@ -1052,8 +1103,11 @@ def score_candidate(
     SCORING COMPONENTS:
         +3  exact label match (case-insensitive)
         +2  close label match (after normalization)
+        +1  fuzzy match via rapidfuzz token_set_ratio >= 85 (if no exact/close)
+        +2  DeezyMatch neural model confirms match (if model loaded)
         +2  year matches our year_hint
         +1  candidate has an image (P18)
+        +1  cross-source validation (TMDb/OpenLibrary confirms identity)
         -2  penalty if this is from a fuzzy query (less reliable)
 
     RETURNS:
@@ -1114,6 +1168,35 @@ def score_candidate(
             elif _normalize_for_comparison(alt_label) == norm_title:
                 result["score"] += CONFIDENCE["CLOSE_LABEL_BONUS"]
                 result["score_breakdown"]["alt_label_match"] = CONFIDENCE["CLOSE_LABEL_BONUS"]
+
+    # --- Score: rapidfuzz token-based similarity (if no exact/close match) ---
+    # Only apply if we didn't already get a label bonus — this catches
+    # near-matches like word reordering, minor spelling differences, or
+    # titles with extra words (e.g., "The Adventures of Augie March" vs
+    # "Adventures of Augie March").
+    has_label_bonus = any(
+        k in result["score_breakdown"]
+        for k in ("exact_label", "close_label", "alt_label_match")
+    )
+    if not has_label_bonus and HAS_RAPIDFUZZ:
+        fuzzy_threshold = CONFIDENCE["FUZZY_MATCH_THRESHOLD"]
+        # Check primary label
+        best_fuzzy = rfuzz.token_set_ratio(
+            title.lower(), result["label"].lower()
+        )
+        # Also check alt labels
+        for al in result.get("alt_labels", []):
+            al_score = rfuzz.token_set_ratio(title.lower(), al.lower())
+            best_fuzzy = max(best_fuzzy, al_score)
+
+        result["fuzzy_score"] = round(best_fuzzy, 1)
+        if best_fuzzy >= fuzzy_threshold:
+            result["score"] += CONFIDENCE["FUZZY_MATCH_BONUS"]
+            result["score_breakdown"]["fuzzy_match"] = CONFIDENCE["FUZZY_MATCH_BONUS"]
+            logging.debug(
+                f"  Fuzzy match bonus: '{result['label']}' vs '{title}' "
+                f"score={best_fuzzy:.1f} >= {fuzzy_threshold}"
+            )
 
     # --- Extract and score: year ---
     date_str = candidate.get("date", {}).get("value", "")
@@ -1259,15 +1342,30 @@ def merge_candidates(raw_bindings: list[dict], title: str, year_hint: Optional[i
         )
         if has_label_bonus:
             continue
+        matched = False
         for al in cand.get("alt_labels", []):
             if al.lower() == title.lower():
                 cand["score"] += CONFIDENCE["CLOSE_LABEL_BONUS"]
                 cand["score_breakdown"]["alt_label_match"] = CONFIDENCE["CLOSE_LABEL_BONUS"]
+                matched = True
                 break
             elif _normalize_for_comparison(al) == norm_title:
                 cand["score"] += CONFIDENCE["CLOSE_LABEL_BONUS"]
                 cand["score_breakdown"]["alt_label_match"] = CONFIDENCE["CLOSE_LABEL_BONUS"]
+                matched = True
                 break
+
+        # If still no label bonus, try rapidfuzz on merged alt_labels
+        if not matched and HAS_RAPIDFUZZ and "fuzzy_match" not in cand["score_breakdown"]:
+            fuzzy_threshold = CONFIDENCE["FUZZY_MATCH_THRESHOLD"]
+            best_fuzzy = rfuzz.token_set_ratio(title.lower(), cand["label"].lower())
+            for al in cand.get("alt_labels", []):
+                al_score = rfuzz.token_set_ratio(title.lower(), al.lower())
+                best_fuzzy = max(best_fuzzy, al_score)
+            cand["fuzzy_score"] = round(best_fuzzy, 1)
+            if best_fuzzy >= fuzzy_threshold:
+                cand["score"] += CONFIDENCE["FUZZY_MATCH_BONUS"]
+                cand["score_breakdown"]["fuzzy_match"] = CONFIDENCE["FUZZY_MATCH_BONUS"]
 
     candidates = list(by_qid.values())
     candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -1317,6 +1415,666 @@ def confidence_gate(candidates: list[dict]) -> Optional[dict]:
         f"breakdown={top['score_breakdown']}"
     )
     return top
+
+
+# ===========================================================================
+# SECTION 5b: DEEZYMATCH INTEGRATION
+# ===========================================================================
+# DeezyMatch provides deep-learning-based fuzzy string matching. It uses
+# neural network embeddings to compare strings, which can catch matches
+# that simple string metrics miss (transliterations, abbreviations, etc.).
+#
+# This is entirely optional — only activated when:
+#   1. The DeezyMatch package is installed (pip install DeezyMatch)
+#   2. A pre-trained model path is provided via --deezymatch-model
+#
+# WORKFLOW:
+#   - Training:  Use --deezymatch-train to generate training data from
+#                successful enrichment runs, then train a model externally.
+#   - Inference: Use --deezymatch-model to load a trained model and add
+#                DeezyMatch scoring as a confidence signal.
+
+class DeezyMatchScorer:
+    """
+    Wrapper around DeezyMatch for scoring candidate labels against queries.
+
+    Provides two modes:
+    1. On-the-fly candidate ranking using a pre-trained model
+    2. Training data generation from successful enrichment matches
+
+    The scorer operates as an additional confidence signal — it does NOT
+    replace the existing Wikidata EntitySearch + scoring pipeline, it
+    augments it. A DeezyMatch bonus is added to candidates that the
+    neural model considers a match.
+    """
+
+    def __init__(self, model_path: str, vocab_path: str, input_config: str):
+        """
+        Initialize the DeezyMatch scorer with a pre-trained model.
+
+        PARAMETERS:
+            model_path:   Path to trained .model file
+            vocab_path:   Path to trained .vocab file
+            input_config: Path to input_dfm.yaml configuration file
+        """
+        if not HAS_DEEZYMATCH:
+            raise RuntimeError(
+                "DeezyMatch is not installed. Install with: pip install DeezyMatch"
+            )
+        self.model_path = model_path
+        self.vocab_path = vocab_path
+        self.input_config = input_config
+        self._candidate_cache = {}
+        logging.info(f"DeezyMatch scorer initialized: model={model_path}")
+
+    def score_pair(self, query: str, candidate_label: str) -> float:
+        """
+        Score a single query-candidate pair using DeezyMatch inference.
+
+        Uses on-the-fly candidate ranking with the query against a single
+        candidate. Returns a similarity score (lower = more similar for
+        L2 distance, higher = more similar for cosine).
+
+        RETURNS:
+            Float score in [0, 1] range (1 = perfect match, 0 = no match).
+        """
+        import tempfile
+        import os
+
+        try:
+            # Write a temporary candidates file
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, prefix="dm_cand_"
+            ) as f:
+                f.write(f"{candidate_label}\n")
+                cand_path = f.name
+
+            # Use on-the-fly candidate ranking
+            # First generate candidate vectors
+            dm_inference(
+                input_file_path=self.input_config,
+                dataset_path=cand_path,
+                pretrained_model_path=self.model_path,
+                pretrained_vocab_path=self.vocab_path,
+                inference_mode="vect",
+                scenario="__dm_temp_candidates__",
+            )
+
+            dm_combine_vecs(
+                rnn_passes=["fwd", "bwd"],
+                input_scenario="__dm_temp_candidates__",
+                output_scenario="__dm_temp_combined__",
+                print_every=1000,
+            )
+
+            # Rank the query against the candidate
+            results_df = dm_candidate_ranker(
+                candidate_scenario="./__dm_temp_combined__",
+                query=[query],
+                ranking_metric="faiss",
+                selection_threshold=10.0,
+                num_candidates=1,
+                search_size=1,
+                output_path="__dm_temp_results__",
+                pretrained_model_path=self.model_path,
+                pretrained_vocab_path=self.vocab_path,
+                number_test_rows=1,
+            )
+
+            if results_df is not None and len(results_df) > 0:
+                # DeezyMatch returns cosine distance; convert to similarity
+                # Lower distance = better match
+                distance = float(results_df.iloc[0].get("faiss_distance", 10.0))
+                # Normalize: distance of 0 → score 1.0, distance of 10 → score 0.0
+                similarity = max(0.0, min(1.0, 1.0 - (distance / 10.0)))
+                return similarity
+
+        except Exception as e:
+            logging.debug(f"  DeezyMatch scoring failed: {e}")
+        finally:
+            # Clean up temp files
+            for path in [cand_path]:
+                try:
+                    os.unlink(path)
+                except (OSError, UnboundLocalError):
+                    pass
+            # Clean up temp directories
+            for dirname in ["__dm_temp_candidates__", "__dm_temp_combined__", "__dm_temp_results__"]:
+                try:
+                    shutil.rmtree(dirname, ignore_errors=True)
+                except OSError:
+                    pass
+
+        return 0.0
+
+    def score_candidates(
+        self, query: str, candidates: list[dict], threshold: float = 0.5
+    ) -> list[dict]:
+        """
+        Score and augment a list of candidates with DeezyMatch similarity.
+
+        Adds 'deezymatch_score' to each candidate dict. If the score
+        exceeds the threshold, adds a DEEZYMATCH_BONUS to the candidate's
+        confidence score.
+
+        PARAMETERS:
+            query:      The search title to match against
+            candidates: List of candidate dicts from merge_candidates()
+            threshold:  Minimum DeezyMatch similarity to earn a bonus (0-1)
+
+        RETURNS:
+            The same candidates list, with scores updated in-place.
+        """
+        for cand in candidates:
+            label = cand.get("label", "")
+            if not label:
+                continue
+
+            # Check primary label
+            best_score = self.score_pair(query, label)
+
+            # Also check alt labels
+            for al in cand.get("alt_labels", []):
+                al_score = self.score_pair(query, al)
+                best_score = max(best_score, al_score)
+
+            cand["deezymatch_score"] = round(best_score, 3)
+
+            if best_score >= threshold:
+                cand["score"] += CONFIDENCE["DEEZYMATCH_BONUS"]
+                cand["score_breakdown"]["deezymatch"] = CONFIDENCE["DEEZYMATCH_BONUS"]
+                logging.debug(
+                    f"  DeezyMatch bonus: '{label}' vs '{query}' "
+                    f"score={best_score:.3f} >= {threshold}"
+                )
+
+        # Re-sort after adding DeezyMatch scores
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        return candidates
+
+
+def generate_deezymatch_training_data(
+    entries: list[dict], output_path: str
+) -> int:
+    """
+    Generate DeezyMatch training data from successful enrichment results.
+
+    Creates a tab-separated file with columns:
+        string1 \\t string2 \\t label
+
+    POSITIVE PAIRS (TRUE):
+        - search_title <-> Wikidata label (for accepted matches)
+        - clean_title <-> Wikidata label
+        - search_title <-> alt_labels
+
+    NEGATIVE PAIRS (FALSE):
+        - search_title <-> labels from rejected/skipped candidates
+        - Randomly paired titles from different entries
+
+    RETURNS:
+        Number of training pairs written.
+    """
+    import random
+    pairs = []
+
+    enriched_entries = [e for e in entries if e.get("enriched")]
+    all_titles = [e.get("search_title", e.get("clean_title", "")) for e in entries]
+
+    for entry in entries:
+        search_title = entry.get("search_title", entry.get("clean_title", ""))
+        clean_title = entry.get("clean_title", "")
+
+        if entry.get("enriched") and entry.get("wikidata_label"):
+            wd_label = entry["wikidata_label"]
+
+            # Positive: search_title <-> Wikidata label
+            pairs.append((search_title, wd_label, "TRUE"))
+
+            # Positive: clean_title <-> Wikidata label (if different)
+            if clean_title != search_title:
+                pairs.append((clean_title, wd_label, "TRUE"))
+
+            # Positive: against alt labels
+            for al in entry.get("wikidata_alt_labels", []):
+                pairs.append((search_title, al, "TRUE"))
+
+        # Negative: pair with random unrelated titles
+        if len(all_titles) > 5:
+            neg_candidates = [t for t in all_titles if t != search_title]
+            for neg in random.sample(neg_candidates, min(3, len(neg_candidates))):
+                pairs.append((search_title, neg, "FALSE"))
+
+    # Write output
+    with open(output_path, "w", encoding="utf-8") as f:
+        for s1, s2, label in pairs:
+            # DeezyMatch expects tab-separated, no tabs in strings
+            s1_clean = s1.replace("\t", " ").strip()
+            s2_clean = s2.replace("\t", " ").strip()
+            if s1_clean and s2_clean:
+                f.write(f"{s1_clean}\t{s2_clean}\t{label}\n")
+
+    logging.info(f"Generated {len(pairs)} DeezyMatch training pairs → {output_path}")
+    return len(pairs)
+
+
+def generate_deezymatch_config(output_path: str) -> str:
+    """
+    Generate a default DeezyMatch input_dfm.yaml configuration tuned
+    for media title matching.
+
+    RETURNS:
+        Path to the generated config file.
+    """
+    config = {
+        "general": {
+            "mode": "train",
+        },
+        "preprocessing": {
+            "lowercase": True,
+            "strip_accents": True,
+            "remove_punctuation": False,
+        },
+        "tokenization": {
+            "type": "char",
+            "ngram_size": 3,
+        },
+        "network": {
+            "architecture": "GRU",
+            "hidden_size": 128,
+            "num_layers": 2,
+            "bidirectional": True,
+            "dropout": 0.2,
+            "pooling": "attention",
+        },
+        "training": {
+            "epochs": 30,
+            "batch_size": 64,
+            "learning_rate": 0.001,
+            "early_stopping": True,
+            "patience": 5,
+            "train_proportion": 0.7,
+            "val_proportion": 0.15,
+            "test_proportion": 0.15,
+        },
+    }
+
+    import yaml
+    try:
+        import yaml as yaml_lib
+    except ImportError:
+        # Fall back to writing raw YAML manually
+        yaml_lib = None
+
+    if yaml_lib:
+        with open(output_path, "w") as f:
+            yaml_lib.dump(config, f, default_flow_style=False)
+    else:
+        # Simple manual YAML output
+        lines = []
+        def _write_dict(d, indent=0):
+            for k, v in d.items():
+                prefix = "  " * indent
+                if isinstance(v, dict):
+                    lines.append(f"{prefix}{k}:")
+                    _write_dict(v, indent + 1)
+                elif isinstance(v, bool):
+                    lines.append(f"{prefix}{k}: {'true' if v else 'false'}")
+                else:
+                    lines.append(f"{prefix}{k}: {v}")
+        _write_dict(config)
+        with open(output_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    logging.info(f"Generated DeezyMatch config → {output_path}")
+    return output_path
+
+
+# ===========================================================================
+# SECTION 5c: CROSS-SOURCE VALIDATION
+# ===========================================================================
+# After finding a Wikidata match, optionally verify it against other data
+# sources (TMDb, Open Library) to increase confidence. If multiple sources
+# agree on the identity, we add a CROSS_SOURCE_BONUS.
+
+def cross_validate_match(
+    entry: dict,
+    winner: dict,
+    session: "requests.Session",
+    tmdb_key: Optional[str] = None,
+    sleep_time: float = 0.3,
+) -> bool:
+    """
+    Validate a Wikidata match against secondary data sources.
+
+    STRATEGY:
+        - Movies/Shows with TMDb ID: Query TMDb and check if the title
+          matches what Wikidata gave us.
+        - Books with Open Library ID: Check if Open Library has a similar
+          title for this work.
+        - Games with Steam ID: Verify the Steam store page exists.
+
+    RETURNS:
+        True if cross-validation confirms the match, False otherwise.
+        A True result doesn't guarantee correctness, but adds confidence.
+    """
+    media_type = entry["type"]
+    search_title = entry.get("search_title", entry.get("clean_title", ""))
+
+    try:
+        # --- Movies/Shows: Cross-validate with TMDb ---
+        if media_type in ("movie", "show") and tmdb_key:
+            tmdb_id = (
+                winner.get("tmdb_movie_id") if media_type == "movie"
+                else winner.get("tmdb_tv_id")
+            )
+            if tmdb_id:
+                tmdb_type = "movie" if media_type == "movie" else "tv"
+                url = f"{TMDB_API_BASE}/{tmdb_type}/{tmdb_id}"
+                resp = session.get(
+                    url,
+                    params={"api_key": tmdb_key, "language": "en-US"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    tmdb_title = data.get("title") or data.get("name") or ""
+                    if tmdb_title:
+                        norm_tmdb = _normalize_for_comparison(tmdb_title)
+                        norm_wd = _normalize_for_comparison(winner.get("label", ""))
+                        norm_search = _normalize_for_comparison(search_title)
+
+                        # Check if TMDb title matches either Wikidata label or search title
+                        if norm_tmdb == norm_wd or norm_tmdb == norm_search:
+                            logging.debug(
+                                f"  Cross-validated via TMDb: '{tmdb_title}' matches"
+                            )
+                            return True
+
+                        # Fuzzy check with rapidfuzz
+                        if HAS_RAPIDFUZZ:
+                            tmdb_fuzzy = rfuzz.token_set_ratio(
+                                search_title.lower(), tmdb_title.lower()
+                            )
+                            if tmdb_fuzzy >= 85:
+                                logging.debug(
+                                    f"  Cross-validated via TMDb (fuzzy): "
+                                    f"'{tmdb_title}' score={tmdb_fuzzy:.1f}"
+                                )
+                                return True
+
+                time.sleep(sleep_time)
+
+        # --- Books: Cross-validate with Open Library ---
+        if media_type == "book":
+            ol_id = winner.get("open_library_id")
+            if ol_id:
+                url = f"https://openlibrary.org/works/{ol_id}.json"
+                resp = session.get(url, timeout=REQUEST_TIMEOUT)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    ol_title = data.get("title", "")
+                    if ol_title:
+                        norm_ol = _normalize_for_comparison(ol_title)
+                        norm_search = _normalize_for_comparison(search_title)
+                        if norm_ol == norm_search:
+                            logging.debug(
+                                f"  Cross-validated via Open Library: '{ol_title}' matches"
+                            )
+                            return True
+                        if HAS_RAPIDFUZZ:
+                            ol_fuzzy = rfuzz.token_set_ratio(
+                                search_title.lower(), ol_title.lower()
+                            )
+                            if ol_fuzzy >= 85:
+                                logging.debug(
+                                    f"  Cross-validated via Open Library (fuzzy): "
+                                    f"'{ol_title}' score={ol_fuzzy:.1f}"
+                                )
+                                return True
+                time.sleep(sleep_time)
+
+        # --- Games: Cross-validate with Steam ---
+        if media_type == "game":
+            steam_id = winner.get("steam_id")
+            if steam_id:
+                # Steam store API for app details
+                url = f"https://store.steampowered.com/api/appdetails"
+                resp = session.get(
+                    url,
+                    params={"appids": steam_id, "l": "english"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    app_data = data.get(str(steam_id), {}).get("data", {})
+                    steam_title = app_data.get("name", "")
+                    if steam_title:
+                        norm_steam = _normalize_for_comparison(steam_title)
+                        norm_search = _normalize_for_comparison(search_title)
+                        if norm_steam == norm_search:
+                            logging.debug(
+                                f"  Cross-validated via Steam: '{steam_title}' matches"
+                            )
+                            return True
+                        if HAS_RAPIDFUZZ:
+                            steam_fuzzy = rfuzz.token_set_ratio(
+                                search_title.lower(), steam_title.lower()
+                            )
+                            if steam_fuzzy >= 85:
+                                logging.debug(
+                                    f"  Cross-validated via Steam (fuzzy): "
+                                    f"'{steam_title}' score={steam_fuzzy:.1f}"
+                                )
+                                return True
+                time.sleep(sleep_time)
+
+    except Exception as e:
+        logging.debug(f"  Cross-validation error: {e}")
+
+    return False
+
+
+# ===========================================================================
+# SECTION 5d: QA REPORT GENERATION
+# ===========================================================================
+# Generates a detailed quality assurance report after enrichment, flagging
+# potential issues and providing statistics on match quality.
+
+def generate_qa_report(entries: list[dict], output_path: Optional[str] = None) -> str:
+    """
+    Generate a comprehensive QA report for enrichment results.
+
+    REPORTS ON:
+        - Overall match rate and confidence distribution
+        - Low-confidence matches (accepted but score near threshold)
+        - Year mismatches between hint and Wikidata
+        - Missing covers for enriched entries
+        - Fuzzy-only matches (no exact/close label match)
+        - Duplicate Wikidata QIDs (multiple entries matched same item)
+        - Entries that failed enrichment with reasons
+        - Cross-source validation results
+
+    RETURNS:
+        The report as a string (also written to output_path if provided).
+    """
+    lines = []
+    lines.append("=" * 70)
+    lines.append("QA REPORT — Media Enrichment Quality Assurance")
+    lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("=" * 70)
+
+    total = len(entries)
+    enriched = [e for e in entries if e.get("enriched")]
+    failed = [e for e in entries if not e.get("enriched")]
+
+    # --- Overall Statistics ---
+    lines.append("")
+    lines.append("## OVERALL STATISTICS")
+    lines.append(f"  Total entries:          {total}")
+    lines.append(f"  Enriched:               {len(enriched)} ({_pct(len(enriched), total)})")
+    lines.append(f"  Failed:                 {len(failed)} ({_pct(len(failed), total)})")
+
+    # Confidence distribution
+    if enriched:
+        scores = [e.get("match_score", 0) for e in enriched]
+        lines.append(f"  Avg confidence score:   {sum(scores) / len(scores):.1f}")
+        lines.append(f"  Min confidence score:   {min(scores)}")
+        lines.append(f"  Max confidence score:   {max(scores)}")
+
+    # Coverage by type
+    type_stats = {}
+    for e in entries:
+        t = e["type"]
+        type_stats.setdefault(t, {"total": 0, "enriched": 0})
+        type_stats[t]["total"] += 1
+        if e.get("enriched"):
+            type_stats[t]["enriched"] += 1
+
+    lines.append("")
+    lines.append("  Per-type match rates:")
+    for t, s in sorted(type_stats.items()):
+        lines.append(f"    {t:8s}: {s['enriched']}/{s['total']} ({_pct(s['enriched'], s['total'])})")
+
+    # --- Flags: Low Confidence Matches ---
+    low_conf = [
+        e for e in enriched
+        if e.get("match_score", 0) <= CONFIDENCE["ACCEPT_THRESHOLD"] + 1
+    ]
+    if low_conf:
+        lines.append("")
+        lines.append(f"## LOW CONFIDENCE MATCHES ({len(low_conf)} items)")
+        lines.append("  These matches were accepted but scored near the threshold.")
+        lines.append("  Consider manual verification.")
+        for e in low_conf:
+            lines.append(
+                f"  - [{e['type']}] \"{e['clean_title']}\" "
+                f"→ {e.get('wikidata_qid', '?')} "
+                f"(score={e.get('match_score', '?')}, "
+                f"breakdown={e.get('match_breakdown', {})})"
+            )
+
+    # --- Flags: Fuzzy-Only Matches ---
+    fuzzy_only = [
+        e for e in enriched
+        if e.get("match_breakdown", {}).get("fuzzy_match")
+        and not any(
+            k in e.get("match_breakdown", {})
+            for k in ("exact_label", "close_label", "alt_label_match")
+        )
+    ]
+    if fuzzy_only:
+        lines.append("")
+        lines.append(f"## FUZZY-ONLY MATCHES ({len(fuzzy_only)} items)")
+        lines.append("  No exact/close label match — matched only via fuzzy scoring.")
+        for e in fuzzy_only:
+            lines.append(
+                f"  - [{e['type']}] \"{e['clean_title']}\" "
+                f"→ \"{e.get('wikidata_label', '?')}\" "
+                f"(fuzzy={e.get('fuzzy_score', '?')})"
+            )
+
+    # --- Flags: Year Mismatches ---
+    year_mismatches = [
+        e for e in enriched
+        if e.get("year_hint") and e.get("enriched_year")
+        and e["year_hint"] != e["enriched_year"]
+    ]
+    if year_mismatches:
+        lines.append("")
+        lines.append(f"## YEAR MISMATCHES ({len(year_mismatches)} items)")
+        lines.append("  Year from input differs from Wikidata year.")
+        for e in year_mismatches:
+            lines.append(
+                f"  - [{e['type']}] \"{e['clean_title']}\" "
+                f"hint={e['year_hint']} vs wikidata={e['enriched_year']}"
+            )
+
+    # --- Flags: Missing Covers ---
+    no_cover = [e for e in enriched if not e.get("cover_filename")]
+    if no_cover:
+        lines.append("")
+        lines.append(f"## MISSING COVERS ({len(no_cover)} enriched items without cover)")
+        for e in no_cover:
+            lines.append(
+                f"  - [{e['type']}] \"{e['clean_title']}\" ({e.get('wikidata_qid', '?')})"
+            )
+
+    # --- Flags: Duplicate QIDs ---
+    qid_to_entries = {}
+    for e in enriched:
+        qid = e.get("wikidata_qid")
+        if qid:
+            qid_to_entries.setdefault(qid, []).append(e)
+    dupes = {qid: es for qid, es in qid_to_entries.items() if len(es) > 1}
+    if dupes:
+        lines.append("")
+        lines.append(f"## DUPLICATE WIKIDATA MATCHES ({len(dupes)} QIDs matched multiple entries)")
+        lines.append("  Multiple input entries matched the same Wikidata item.")
+        for qid, es in dupes.items():
+            titles = [f"\"{e['clean_title']}\"" for e in es]
+            lines.append(f"  - {qid}: {', '.join(titles)}")
+
+    # --- Flags: Cross-Source Validation ---
+    cross_validated = [e for e in enriched if e.get("cross_validated")]
+    cross_failed = [e for e in enriched if e.get("cross_validated") is False]
+    if cross_validated or cross_failed:
+        lines.append("")
+        lines.append(f"## CROSS-SOURCE VALIDATION")
+        lines.append(f"  Confirmed:   {len(cross_validated)}")
+        lines.append(f"  Unconfirmed: {len(cross_failed)}")
+        if cross_failed:
+            lines.append("  Unconfirmed entries (no secondary source verified):")
+            for e in cross_failed[:10]:
+                lines.append(
+                    f"  - [{e['type']}] \"{e['clean_title']}\" ({e.get('wikidata_qid', '?')})"
+                )
+
+    # --- Failed Entries ---
+    if failed:
+        lines.append("")
+        lines.append(f"## FAILED ENRICHMENTS ({len(failed)} items)")
+        by_reason = {}
+        for e in failed:
+            reason = e.get("skip_reason", "unknown")
+            by_reason.setdefault(reason, []).append(e)
+        for reason, es in sorted(by_reason.items()):
+            lines.append(f"  {reason}: {len(es)} items")
+            for e in es[:5]:
+                lines.append(f"    - [{e['type']}] \"{e['clean_title']}\"")
+            if len(es) > 5:
+                lines.append(f"    ... and {len(es) - 5} more")
+
+    # --- DeezyMatch stats ---
+    dm_scored = [e for e in enriched if e.get("deezymatch_score") is not None]
+    if dm_scored:
+        lines.append("")
+        lines.append(f"## DEEZYMATCH STATISTICS")
+        dm_scores = [e["deezymatch_score"] for e in dm_scored]
+        dm_bonus = [e for e in dm_scored if e.get("match_breakdown", {}).get("deezymatch")]
+        lines.append(f"  Entries scored:         {len(dm_scored)}")
+        lines.append(f"  Avg DeezyMatch score:   {sum(dm_scores) / len(dm_scores):.3f}")
+        lines.append(f"  DeezyMatch bonus given: {len(dm_bonus)}")
+
+    lines.append("")
+    lines.append("=" * 70)
+    lines.append("END OF QA REPORT")
+    lines.append("=" * 70)
+
+    report = "\n".join(lines)
+
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(report)
+        logging.info(f"QA report written to: {output_path}")
+
+    return report
+
+
+def _pct(num: int, total: int) -> str:
+    """Format a percentage string, handling zero division."""
+    if total == 0:
+        return "0.0%"
+    return f"{100 * num / total:.1f}%"
 
 
 def download_cover(
@@ -1704,6 +2462,8 @@ def enrich_entry(
     streaming: bool = False,
     tmdb_key: Optional[str] = None,
     country: str = "US",
+    deezymatch_scorer: Optional["DeezyMatchScorer"] = None,
+    cross_validate: bool = False,
 ) -> dict:
     """
     Enrich a single entry with Wikidata metadata.
@@ -1712,7 +2472,9 @@ def enrich_entry(
         1. Build SPARQL query using EntitySearch (indexed, fast)
         2. Execute query
         3. Score and merge candidates
+        3b. (Optional) Apply DeezyMatch neural scoring to candidates
         4. Apply confidence gate
+        4b. (Optional) Cross-validate accepted match against secondary sources
         6. If accepted: extract year, download cover, extract genres
         7. If --streaming: extract platform links, query TMDb for watch providers
         8. Attach enrichment data to the entry
@@ -1769,6 +2531,10 @@ def enrich_entry(
     bindings = query_wikidata(sparql, session)
     candidates = merge_candidates(bindings, search_title, year_hint, is_fuzzy=False)
 
+    # --- Step 3b: DeezyMatch neural scoring (optional) ---
+    if deezymatch_scorer and candidates:
+        deezymatch_scorer.score_candidates(search_title, candidates)
+
     # --- Step 4-5: Confidence gate ---
     winner = confidence_gate(candidates)
 
@@ -1812,6 +2578,29 @@ def enrich_entry(
         entry["skip_reason"] = reason
         logging.info(f"  SKIP: '{title}' — {reason}")
         return entry
+
+    # --- Step 5b: Store match metadata for QA reporting ---
+    entry["match_score"] = winner["score"]
+    entry["match_breakdown"] = winner["score_breakdown"].copy()
+    entry["wikidata_label"] = winner.get("label", "")
+    entry["wikidata_alt_labels"] = winner.get("alt_labels", [])
+    if "fuzzy_score" in winner:
+        entry["fuzzy_score"] = winner["fuzzy_score"]
+    if "deezymatch_score" in winner:
+        entry["deezymatch_score"] = winner["deezymatch_score"]
+
+    # --- Step 5c: Cross-source validation (optional) ---
+    if cross_validate and not dry_run:
+        validated = cross_validate_match(
+            entry, winner, session, tmdb_key=tmdb_key, sleep_time=sleep_time
+        )
+        entry["cross_validated"] = validated
+        if validated:
+            winner["score"] += CONFIDENCE["CROSS_SOURCE_BONUS"]
+            winner["score_breakdown"]["cross_source"] = CONFIDENCE["CROSS_SOURCE_BONUS"]
+            entry["match_score"] = winner["score"]
+            entry["match_breakdown"] = winner["score_breakdown"].copy()
+            logging.info(f"  Cross-validated: +{CONFIDENCE['CROSS_SOURCE_BONUS']} confidence")
 
     # --- Step 6: Extract data from the winner ---
     entry["enriched"] = True
@@ -2321,6 +3110,64 @@ EXAMPLES:
         ),
     )
 
+    # --- DeezyMatch arguments ---
+    parser.add_argument(
+        "--deezymatch-model",
+        default=None,
+        help=(
+            "Path to a trained DeezyMatch model directory. Enables neural "
+            "fuzzy matching as an additional confidence signal. The directory "
+            "must contain a .model and .vocab file."
+        ),
+    )
+    parser.add_argument(
+        "--deezymatch-config",
+        default=None,
+        help="Path to DeezyMatch input_dfm.yaml config file.",
+    )
+    parser.add_argument(
+        "--deezymatch-train",
+        default=None,
+        metavar="OUTPUT_PATH",
+        help=(
+            "After enrichment, generate DeezyMatch training data from "
+            "successful matches and write to this file. Use this to build "
+            "training datasets for custom DeezyMatch models."
+        ),
+    )
+    parser.add_argument(
+        "--deezymatch-generate-config",
+        default=None,
+        metavar="OUTPUT_PATH",
+        help=(
+            "Generate a default DeezyMatch input_dfm.yaml config file "
+            "tuned for media title matching and exit."
+        ),
+    )
+
+    # --- QA / Validation arguments ---
+    parser.add_argument(
+        "--cross-validate",
+        action="store_true",
+        help=(
+            "After finding a Wikidata match, verify it against secondary "
+            "sources (TMDb, Open Library, Steam). Adds a confidence bonus "
+            "when confirmed. Slower due to additional API calls."
+        ),
+    )
+    parser.add_argument(
+        "--qa-report",
+        default=None,
+        metavar="OUTPUT_PATH",
+        help=(
+            "Generate a QA report after enrichment. Flags low-confidence "
+            "matches, year mismatches, missing covers, duplicate QIDs, "
+            "and other potential issues. If no path given, prints to stdout."
+        ),
+        nargs="?",
+        const="__stdout__",
+    )
+
     return parser
 
 
@@ -2375,6 +3222,14 @@ def main():
     logging.info("=" * 60)
     logging.info("Media Library Generator + Metadata Enricher")
     logging.info("=" * 60)
+
+    # -----------------------------------------------------------------------
+    # STEP 2b: Handle --deezymatch-generate-config (early exit)
+    # -----------------------------------------------------------------------
+    if args.deezymatch_generate_config:
+        generate_deezymatch_config(args.deezymatch_generate_config)
+        print(f"DeezyMatch config written to: {args.deezymatch_generate_config}")
+        sys.exit(0)
 
     # -----------------------------------------------------------------------
     # STEP 3: Validate inputs
@@ -2504,6 +3359,38 @@ def main():
                 sys.exit(1)
 
             logging.info("--- Enriching with Wikidata ---")
+
+            # Optional matching enhancements
+            if HAS_RAPIDFUZZ:
+                logging.info("  rapidfuzz available: fuzzy scoring enabled")
+            if not HAS_RAPIDFUZZ:
+                logging.info("  rapidfuzz not installed: install with 'pip install rapidfuzz' for better matching")
+
+            # Initialize DeezyMatch scorer if model provided
+            dm_scorer = None
+            if args.deezymatch_model:
+                if not HAS_DEEZYMATCH:
+                    logging.error(
+                        "DeezyMatch not installed. Install with: pip install DeezyMatch"
+                    )
+                    sys.exit(1)
+                model_dir = Path(args.deezymatch_model)
+                model_file = list(model_dir.glob("*.model"))
+                vocab_file = list(model_dir.glob("*.vocab"))
+                if not model_file or not vocab_file:
+                    logging.error(f"No .model or .vocab file found in {model_dir}")
+                    sys.exit(1)
+                dm_config = args.deezymatch_config
+                if not dm_config:
+                    logging.error("--deezymatch-config is required when using --deezymatch-model")
+                    sys.exit(1)
+                dm_scorer = DeezyMatchScorer(
+                    model_path=str(model_file[0]),
+                    vocab_path=str(vocab_file[0]),
+                    input_config=dm_config,
+                )
+                logging.info("  DeezyMatch scorer: enabled")
+
             session = requests.Session()
             session.headers.update({"User-Agent": USER_AGENT})
 
@@ -2514,6 +3401,8 @@ def main():
                     sleep_time=args.sleep, dry_run=args.dry_run,
                     streaming=streaming_enabled, tmdb_key=tmdb_key,
                     country=country,
+                    deezymatch_scorer=dm_scorer,
+                    cross_validate=args.cross_validate,
                 )
                 # Throttle between items
                 if i < len(entries):
@@ -2586,6 +3475,26 @@ def main():
                         zf.write(file_path, arcname)
 
             logging.info(f"Zip created: {zip_path}")
+
+        # -----------------------------------------------------------------------
+        # STEP 10b: Generate DeezyMatch training data (optional)
+        # -----------------------------------------------------------------------
+        if args.deezymatch_train and not args.no_enrich:
+            logging.info(f"--- Generating DeezyMatch training data ---")
+            n_pairs = generate_deezymatch_training_data(entries, args.deezymatch_train)
+            print(f"\nDeezyMatch training data: {n_pairs} pairs → {args.deezymatch_train}")
+
+        # -----------------------------------------------------------------------
+        # STEP 10c: Generate QA report (optional)
+        # -----------------------------------------------------------------------
+        if args.qa_report and not args.no_enrich:
+            logging.info("--- Generating QA report ---")
+            if args.qa_report == "__stdout__":
+                report = generate_qa_report(entries)
+                print(report)
+            else:
+                report = generate_qa_report(entries, output_path=args.qa_report)
+                print(f"\nQA report written to: {args.qa_report}")
 
     finally:
         # Always clean up the temp directory in zip mode
