@@ -971,6 +971,17 @@ def query_wikidata(sparql: str, session: "requests.Session") -> list[dict]:
                 time.sleep(5)
                 continue
 
+            if resp.status_code in (500, 502, 503, 504):
+                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                logging.warning(
+                    f"Wikidata returned {resp.status_code}. "
+                    f"Retrying in {wait}s ({attempt+1}/{MAX_RETRIES})..."
+                )
+                if attempt < MAX_RETRIES:
+                    time.sleep(wait)
+                    continue
+                return []
+
             if resp.status_code == 403:
                 logging.warning("Wikidata returned 403 Forbidden. User-Agent may need update.")
                 return []
