@@ -932,6 +932,63 @@ def build_sparql_query_fuzzy(title: str, media_type: str) -> str:
     return query
 
 
+# Global adaptive rate limiter — shared across all query_wikidata calls.
+# When Wikidata pushes back (429, 5xx, timeouts), we increase the cooldown
+# so subsequent queries (including fallback searches) don't pile on.
+_rate_limiter = {
+    "min_interval": DEFAULT_SLEEP,   # baseline from --sleep
+    "current_interval": DEFAULT_SLEEP,
+    "last_request_time": 0.0,
+    "backoff_until": 0.0,            # don't send requests before this time
+}
+
+
+def _rate_limit_wait() -> None:
+    """Wait if needed to respect the adaptive rate limit."""
+    now = time.time()
+    # If we're in a backoff period, wait it out
+    if now < _rate_limiter["backoff_until"]:
+        wait = _rate_limiter["backoff_until"] - now
+        logging.debug(f"  Rate limiter: cooling down for {wait:.1f}s")
+        time.sleep(wait)
+    # Also respect minimum interval between requests
+    elapsed = time.time() - _rate_limiter["last_request_time"]
+    if elapsed < _rate_limiter["current_interval"]:
+        time.sleep(_rate_limiter["current_interval"] - elapsed)
+    _rate_limiter["last_request_time"] = time.time()
+
+
+def _rate_limit_backoff(severity: str = "mild") -> None:
+    """Increase the rate limit after a server pushback.
+
+    severity:
+        "mild"   — timeout or 5xx: double current interval, cooldown 3s
+        "severe" — 429 rate limit: quadruple interval, cooldown 10s
+    """
+    if severity == "severe":
+        _rate_limiter["current_interval"] = min(
+            _rate_limiter["current_interval"] * 4, 10.0
+        )
+        _rate_limiter["backoff_until"] = time.time() + 10.0
+        logging.info(
+            f"  Rate limiter: 429 detected, cooling down 10s "
+            f"(interval now {_rate_limiter['current_interval']:.1f}s)"
+        )
+    else:
+        _rate_limiter["current_interval"] = min(
+            _rate_limiter["current_interval"] * 2, 5.0
+        )
+        _rate_limiter["backoff_until"] = time.time() + 3.0
+
+
+def _rate_limit_success() -> None:
+    """Gradually reduce the rate limit after a successful request."""
+    _rate_limiter["current_interval"] = max(
+        _rate_limiter["current_interval"] * 0.8,
+        _rate_limiter["min_interval"],
+    )
+
+
 def query_wikidata(sparql: str, session: "requests.Session") -> list[dict]:
     """
     Execute a SPARQL query against Wikidata and return parsed results.
@@ -942,7 +999,9 @@ def query_wikidata(sparql: str, session: "requests.Session") -> list[dict]:
 
     ERROR HANDLING:
         - Network errors: logged and return empty
-        - Rate limiting (429): logged with suggestion to increase --sleep
+        - Rate limiting (429): logged, backs off adaptively
+        - Server errors (5xx): retried with exponential backoff
+        - Timeouts: retried with backoff
         - Malformed response: logged and return empty
     """
     if not sparql:
@@ -955,6 +1014,8 @@ def query_wikidata(sparql: str, session: "requests.Session") -> list[dict]:
     params = {"query": sparql}
 
     for attempt in range(MAX_RETRIES + 1):
+        _rate_limit_wait()
+
         try:
             resp = session.get(
                 WIKIDATA_SPARQL_URL,
@@ -964,21 +1025,22 @@ def query_wikidata(sparql: str, session: "requests.Session") -> list[dict]:
             )
 
             if resp.status_code == 429:
+                _rate_limit_backoff("severe")
                 logging.warning(
-                    "Rate limited by Wikidata (429). Consider increasing --sleep. "
-                    f"Waiting 5s before retry {attempt+1}/{MAX_RETRIES}..."
-                )
-                time.sleep(5)
-                continue
-
-            if resp.status_code in (500, 502, 503, 504):
-                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
-                logging.warning(
-                    f"Wikidata returned {resp.status_code}. "
-                    f"Retrying in {wait}s ({attempt+1}/{MAX_RETRIES})..."
+                    f"Rate limited by Wikidata (429). "
+                    f"Retry {attempt+1}/{MAX_RETRIES}..."
                 )
                 if attempt < MAX_RETRIES:
-                    time.sleep(wait)
+                    continue
+                return []
+
+            if resp.status_code in (500, 502, 503, 504):
+                _rate_limit_backoff("mild")
+                logging.warning(
+                    f"Wikidata returned {resp.status_code}. "
+                    f"Retry {attempt+1}/{MAX_RETRIES}..."
+                )
+                if attempt < MAX_RETRIES:
                     continue
                 return []
 
@@ -988,12 +1050,17 @@ def query_wikidata(sparql: str, session: "requests.Session") -> list[dict]:
 
             resp.raise_for_status()
             data = resp.json()
+            _rate_limit_success()
             return data.get("results", {}).get("bindings", [])
 
         except requests.exceptions.Timeout:
-            logging.warning(f"Wikidata query timed out (attempt {attempt+1}/{MAX_RETRIES})")
+            _rate_limit_backoff("mild")
+            logging.warning(
+                f"Wikidata query timed out "
+                f"(attempt {attempt+1}/{MAX_RETRIES+1})"
+            )
             if attempt < MAX_RETRIES:
-                time.sleep(2)
+                continue
         except requests.exceptions.RequestException as e:
             logging.warning(f"Wikidata request failed: {e}")
             return []
@@ -1747,7 +1814,6 @@ def enrich_entry(
             logging.info(f"  Year-qualified search: '{year_title}' [{media_type}]")
             fb_sparql = build_sparql_query(year_title, media_type)
             if fb_sparql:
-                time.sleep(sleep_time)
                 fb_bindings = query_wikidata(fb_sparql, session)
                 fb_candidates = merge_candidates(fb_bindings, search_title, year_hint, is_fuzzy=True)
                 winner = confidence_gate(fb_candidates)
@@ -1763,7 +1829,6 @@ def enrich_entry(
             fb_sparql = build_sparql_query(fb_title, media_type)
             if not fb_sparql:
                 continue
-            time.sleep(sleep_time)
             fb_bindings = query_wikidata(fb_sparql, session)
             fb_candidates = merge_candidates(fb_bindings, fb_title, year_hint, is_fuzzy=True)
             winner = confidence_gate(fb_candidates)
@@ -2462,6 +2527,10 @@ def main():
             session = requests.Session()
             session.headers.update({"User-Agent": USER_AGENT})
 
+            # Initialize adaptive rate limiter from --sleep
+            _rate_limiter["min_interval"] = args.sleep
+            _rate_limiter["current_interval"] = args.sleep
+
             for i, entry in enumerate(entries, start=1):
                 logging.info(f"[{i}/{len(entries)}] Processing: '{entry['clean_title']}' [{entry['type']}]")
                 enrich_entry(
@@ -2470,9 +2539,10 @@ def main():
                     streaming=streaming_enabled, tmdb_key=tmdb_key,
                     country=country,
                 )
-                # Throttle between items
+                # Throttle between items (rate limiter handles adaptive delays,
+                # but we always wait at least --sleep between entries)
                 if i < len(entries):
-                    time.sleep(args.sleep)
+                    time.sleep(_rate_limiter["current_interval"])
         else:
             logging.info("--- Skipping enrichment (--no-enrich) ---")
             for entry in entries:
